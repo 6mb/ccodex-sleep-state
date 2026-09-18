@@ -1,0 +1,16 @@
+/.work/
+/dist/
+/coverage.out
+*.test
+*.exe
+.DS_Store
+/config.local.json
+/runtime/
+/ccodex-sleep-state
+/vendor/
+/config.json
+/auth.json
+/.env
+/logs/
+/state/
+/subscriptions*

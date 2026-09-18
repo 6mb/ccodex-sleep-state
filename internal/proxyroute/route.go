@@ -1,0 +1,192 @@
+package proxyroute
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/gylive/ccodex-sleep-state/internal/settings"
+	"github.com/metacubex/mihomo/adapter"
+	C "github.com/metacubex/mihomo/constant"
+	corelog "github.com/metacubex/mihomo/log"
+)
+
+// A route is immutable once loaded. States refer to its index, so a request
+// uses the same egress that supplied its state. Reloads require a restart.
+type Route struct {
+	ID        string
+	Transport *http.Transport
+	close     func() error
+}
+
+var quietOnce sync.Once
+
+func QuietCore() {
+	quietOnce.Do(func() { corelog.SetLevel(corelog.SILENT) })
+}
+
+func (r Route) Close() {
+	r.Transport.CloseIdleConnections()
+	if r.close != nil {
+		_ = r.close()
+	}
+}
+
+func baseTransport() *http.Transport {
+	return &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}, ForceAttemptHTTP2: true,
+		TLSHandshakeTimeout: 15 * time.Second, ResponseHeaderTimeout: 60 * time.Second, IdleConnTimeout: 90 * time.Second,
+		MaxIdleConns: 32, MaxIdleConnsPerHost: 8, MaxConnsPerHost: 16, MaxResponseHeaderBytes: 1 << 20}
+}
+
+func Build(node map[string]any, index int) (Route, error) {
+	id := fmt.Sprintf("route-%03d", index+1)
+	if err := validateNode(node); err != nil {
+		return Route{}, err
+	}
+	copyNode := make(map[string]any, len(node))
+	for k, v := range node {
+		copyNode[k] = v
+	}
+	copyNode["name"] = id
+	proxy, err := adapter.ParseProxy(copyNode)
+	if err != nil {
+		return Route{}, errors.New("node rejected by outbound core; check protocol fields")
+	}
+	tr := baseTransport()
+	tr.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		metadata := &C.Metadata{NetWork: C.TCP, Type: C.INNER}
+		if err := metadata.SetRemoteAddress(address); err != nil {
+			return nil, errors.New("invalid upstream address")
+		}
+		conn, err := proxy.DialContext(ctx, metadata)
+		if err != nil {
+			return nil, errors.New("proxy connection failed")
+		}
+		return conn, nil
+	}
+	return Route{ID: id, Transport: tr, close: proxy.Close}, nil
+}
+
+func Load(ctx context.Context, c settings.Config) ([]Route, error) {
+	QuietCore()
+	var routes []Route
+	success := false
+	defer func() {
+		if !success {
+			for _, route := range routes {
+				route.Close()
+			}
+		}
+	}()
+	if c.Direct {
+		routes = append(routes, Route{ID: "direct", Transport: baseTransport()})
+	}
+	add := func(nodes []map[string]any) error {
+		for _, node := range nodes {
+			if len(routes) >= MaxNodes {
+				return errors.New("combined proxy pool exceeds 256 nodes")
+			}
+			route, err := Build(node, len(routes))
+			if err != nil {
+				return fmt.Errorf("node %d: %w", len(routes)+1, err)
+			}
+			routes = append(routes, route)
+		}
+		return nil
+	}
+	urls := append([]string(nil), c.ProxyURLs...)
+	for _, name := range c.ProxyEnvs {
+		v := os.Getenv(name)
+		if v == "" {
+			return nil, errors.New("a configured proxy environment variable is empty")
+		}
+		urls = append(urls, v)
+	}
+	for _, raw := range urls {
+		node, err := ParseURI(raw)
+		if err != nil {
+			return nil, errors.New("invalid proxy URI in service config")
+		}
+		if err = add([]map[string]any{node}); err != nil {
+			return nil, err
+		}
+	}
+	download := baseTransport()
+	defer download.CloseIdleConnections()
+	if c.SubscriptionProxyEnv != "" {
+		raw := os.Getenv(c.SubscriptionProxyEnv)
+		u, err := url.Parse(raw)
+		if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https" && u.Scheme != "socks5" && u.Scheme != "socks5h") {
+			return nil, errors.New("invalid subscription download proxy environment variable")
+		}
+		download.Proxy = http.ProxyURL(u)
+	}
+	client := &http.Client{Transport: download, Timeout: 30 * time.Second, CheckRedirect: func(r *http.Request, via []*http.Request) error {
+		if len(via) >= 3 || r.URL.Scheme != "https" {
+			return errors.New("subscription redirect rejected")
+		}
+		return nil
+	}}
+	for i, source := range c.Subscriptions {
+		raw := source.URL
+		if source.URLEnv != "" {
+			if raw != "" {
+				return nil, errors.New("use url or url_env, not both")
+			}
+			raw = os.Getenv(source.URLEnv)
+		}
+		data, err := fetch(ctx, client, raw)
+		if err != nil {
+			return nil, fmt.Errorf("subscription %d: %w", i+1, err)
+		}
+		nodes, err := Parse(data)
+		if err != nil {
+			return nil, fmt.Errorf("subscription %d: %w", i+1, err)
+		}
+		if err = add(nodes); err != nil {
+			return nil, err
+		}
+	}
+	if len(routes) == 0 {
+		return nil, errors.New("no egress configured; add a subscription/proxy or enable direct")
+	}
+	success = true
+	return routes, nil
+}
+
+func fetch(ctx context.Context, client *http.Client, raw string) ([]byte, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" || u.User != nil || (u.Scheme != "https" && !(u.Scheme == "http" && settings.IsLoopback(u.Hostname()))) {
+		return nil, errors.New("subscription must be an HTTPS URL (loopback HTTP is allowed for tests)")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, errors.New("invalid subscription URL")
+	}
+	req.Header.Set("User-Agent", "ccodex-sleep-state/1")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, errors.New("download failed; check connectivity and subscription validity")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("download returned HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, MaxSubscriptionBytes+1))
+	if err != nil {
+		return nil, errors.New("cannot read subscription")
+	}
+	if len(data) > MaxSubscriptionBytes {
+		return nil, errors.New("subscription exceeds 2 MiB")
+	}
+	return data, nil
+}
