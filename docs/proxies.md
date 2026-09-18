@@ -45,6 +45,32 @@ printf '\n'
 
 **订阅只在启动和 `check` 时下载。** 修改或续费后，要正常退出服务再重启，才能加载新的节点。暂时不做热更新，避免在请求中途把 state 对应的出口换掉。
 
+## 下载到了配置，却没有节点？
+
+有的订阅会按下载客户端的 `User-Agent` 返回不同内容。同一个链接，可能给一种客户端完整节点，给另一种客户端空的 `proxies: []`。程序现在会明确报“服务端没有提供节点”，不会把它误报为 Base64 格式错误。
+
+如果你的链接在 Clash Verge 能导入，在这里却拿不到节点，可以给这一条订阅指定下载标识，并只选自己想用的协议：
+
+```json
+{
+  "direct": false,
+  "subscriptions": [
+    {
+      "url_env": "CCODEX_SUBSCRIPTION",
+      "user_agent": "clash-verge/v2.4.2",
+      "include_protocols": ["anytls"],
+      "exclude_keywords": ["香港", "台湾", "臺灣", "台灣", "澳门", "澳門", "Hong Kong", "Taiwan", "Taipei", "Macau", "Macao", "🇭🇰", "🇹🇼", "🇲🇴"]
+    }
+  ]
+}
+```
+
+这是按需使用的例子，不是所有订阅都要照抄。`include_protocols` 不填就不筛协议；`exclude_keywords` 对节点名称和服务器地址做不区分大小写的包含匹配。过滤发生在建立出站适配器之前，被排除的节点不会参与采集。
+
+**名称筛选不是出口定位。** 节点叫“英国”并不能证明流量一定从英国出去。需要确认实际出口时，还要另做检查。
+
+程序不会因为某个节点要求 `skip-cert-verify: true` 就关闭证书校验。可以通过协议筛选排除这类节点，或请服务商提供能正常校验证书的配置。
+
 ## 已有 HTTP / SOCKS5 代理
 
 先在你的代理软件里找到实际监听地址和端口，确认代理软件还在运行。不要照抄别人的端口。
@@ -112,7 +138,7 @@ HTTP/HTTPS 代理使用 CONNECT 隧道。SOCKS5 由代理接收目标域名。�
 | 逐行代理 URI | 每行解析；任一非空、非注释行无效则报错 |
 | Base64 URI 列表 | 支持标准与 URL-safe 字母表，有无 padding 均可 |
 
-支持 HTTP、SOCKS5、SS、SSR、VMess、VLESS、Trojan、Hysteria、Hysteria2 和 TUIC。HTTPS URI 被映射为启用 TLS 的 HTTP 代理。URI 别名与具体可用参数取决于锁定版本的 Mihomo 转换器；不要把“支持协议”理解为支持任意订阅服务商自定义格式。
+支持 HTTP、SOCKS5、AnyTLS、SS、SSR、VMess、VLESS、Trojan、Hysteria、Hysteria2 和 TUIC。HTTPS URI 被映射为启用 TLS 的 HTTP 代理。URI 别名与具体可用参数取决于锁定版本的 Mihomo 转换器；不要把“支持协议”理解为支持任意订阅服务商自定义格式。
 
 SSH、WireGuard、代理组、链式 `dialer-proxy`、绑定系统接口/路由标记、从订阅加载本地证书或私钥都不开放。`skip-cert-verify: true` 会拒绝，避免订阅顺手关闭 TLS 校验。需要这些配置的节点，请换成能在严格校验下连接的出口。
 
@@ -120,8 +146,8 @@ SSH、WireGuard、代理组、链式 `dialer-proxy`、绑定系统接口/路由�
 
 1. Codex 的第一条合法 Astra 请求提供认证头；程序不读取认证文件。
 2. 如果没有可用 state，依次从候选出口发一个很短的独立请求，不带原会话正文和旧 state。
-3. 完成的响应里，封装、时间和块数符合配置基线的值才进入 active / ready。
+3. 完成的响应里，封装、时间和块数符合配置基线的值才进入 active / ready；首条请求拿到可用值就继续，不必等备用值。
 4. 同一请求拿到快照后，固定从该 state 对应的出口转发。
-5. 空闲期间到续补窗口再采；失败受冷却限制，401/403/429 立即结束这一轮。
+5. 空闲时按冷却间隔补备用值，到续补窗口再更新。探测或正式请求遇到 401/403，会暂停这份凭据；遇到 429，按 Retry-After 和本地冷却时间暂停请求及探测，不通过切出口继续请求。
 
 这一步是在为后续 Codex 请求找可用的出口和 state。它会消耗模型额度，也会用到代理流量；遇到账号权限或额度问题，先处理对应问题，再继续。

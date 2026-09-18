@@ -35,7 +35,7 @@ go test ./internal/turnstate -fuzz=FuzzParse -fuzztime=10s
 | `codex_home` | 自动检测 | 优先显式路径，其次 `CODEX_HOME`，再用户 `.codex` |
 | `direct` | `true` | 将直连放在出口池最前；代理专用部署改为 `false` |
 | `proxy_urls` / `proxy_envs` | 空 | 直接代理 URI / 存放 URI 的环境变量名 |
-| `subscriptions` | 空 | `{url}` 或 `{url_env}` 列表 |
+| `subscriptions` | 空 | `{url}` 或 `{url_env}` 列表；每项可设置 `user_agent`、`include_protocols`、`exclude_keywords` |
 | `subscription_proxy_env` | 空 | 仅订阅下载使用的代理变量 |
 | `probe_timeout_seconds` | `20` | 单次探测超时，1–60 秒 |
 | `max_probes_per_round` | `6` | 每轮最多尝试出口数，1–20；单轮不重复同一出口 |

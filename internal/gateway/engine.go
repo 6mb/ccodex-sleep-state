@@ -32,6 +32,8 @@ type session struct {
 	busy                int
 	activated           bool
 	blocked             bool
+	rejectedStatus      int
+	retryUntil          time.Time
 	cursor              int
 	probing             chan struct{}
 }
@@ -116,15 +118,15 @@ func (e *Engine) Run(ctx context.Context) {
 			}
 			e.mu.Unlock()
 			for _, s := range work {
-				if s.state.NeedsRefresh(now) {
-					e.refresh(ctx, s)
+				if s.state.NeedsRefresh(now) || (len(e.routes) > 1 && !s.state.Status(now).Ready) {
+					e.refresh(ctx, s, false)
 				}
 			}
 		}
 	}
 }
 
-func (e *Engine) refresh(ctx context.Context, s *session) {
+func (e *Engine) refresh(ctx context.Context, s *session, bootstrap bool) {
 	s.mu.Lock()
 	if pending := s.probing; pending != nil {
 		s.mu.Unlock()
@@ -163,6 +165,10 @@ func (e *Engine) refresh(ctx context.Context, s *session) {
 			return
 		}
 		s.mu.Lock()
+		if s.blocked || time.Now().Before(s.retryUntil) {
+			s.mu.Unlock()
+			return
+		}
 		route := s.cursor % len(e.routes)
 		s.cursor++
 		s.mu.Unlock()
@@ -186,20 +192,14 @@ func (e *Engine) refresh(ctx context.Context, s *session) {
 		e.log.Info("probe_finished", "route", e.routes[route].ID, "status", status,
 			"accepted", accepted, "result", result, "state_blocks", token.Blocks,
 			"expected_blocks", e.config.BaselineBlocks)
-		// Account and quota errors are not an invitation to try more IP addresses.
-		if status == 401 || status == 403 || status == 429 {
-			s.mu.Lock()
-			s.cursor-- // An account rejection must not cause the next round to switch IPs.
-			s.blocked = status == 401 || status == 403
-			if retryAfter > 0 {
-				s.nextProbe = time.Now().Add(retryAfter)
-			}
-			s.mu.Unlock()
+		// Preserve upstream account limits rather than converting them to a
+		// generic "no state" error or moving on to another egress.
+		if e.reject(s, status, retryAfter, route) {
 			return
 		}
 		if accepted {
 			successes++
-			if successes >= 2 {
+			if bootstrap || successes >= 2 || s.state.Status(time.Now()).Ready {
 				return
 			}
 		}
@@ -209,7 +209,14 @@ func (e *Engine) refresh(ctx context.Context, s *session) {
 func (e *Engine) probe(parent context.Context, h http.Header, route proxyroute.Route) (turnstate.Token, int, time.Duration, error) {
 	ctx, cancel := context.WithTimeout(parent, time.Duration(e.config.ProbeSeconds)*time.Second)
 	defer cancel()
-	body := map[string]any{"model": settings.Model, "instructions": "Reply with OK.", "input": []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_text", "text": "Reply with OK."}}}}, "stream": true, "store": false, "reasoning": map[string]string{"effort": "low"}}
+	// Match the Codex Responses envelope used by the source gateway. Do not
+	// force a lower reasoning effort than the upstream default for collection.
+	body := map[string]any{
+		"model": settings.Model, "instructions": "Reply with OK.",
+		"input":  []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "Reply with OK."}}}},
+		"stream": true, "store": false, "parallel_tool_calls": true,
+		"include": []string{"reasoning.encrypted_content"},
+	}
 	encoded, _ := json.Marshal(body)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(e.config.Upstream, "/")+"/responses", bytes.NewReader(encoded))
 	req.Header = h.Clone()
@@ -252,12 +259,75 @@ func completed(data []byte) bool {
 	return false
 }
 
+// reject is shared by probes and generation responses. A valid active state
+// must not let subsequent requests bypass an upstream auth or quota rejection.
+func (e *Engine) reject(s *session, status int, delay time.Duration, route int) bool {
+	if status != 401 && status != 403 && status != 429 {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cursor = route
+	if status == 401 || status == 403 {
+		s.blocked = true
+		s.rejectedStatus = status
+	} else if !s.blocked {
+		s.rejectedStatus = status
+	}
+	if delay < time.Duration(e.config.CooldownSeconds)*time.Second {
+		delay = time.Duration(e.config.CooldownSeconds) * time.Second
+	}
+	until := time.Now().Add(delay)
+	if until.After(s.retryUntil) {
+		s.retryUntil = until
+	}
+	if until.After(s.nextProbe) {
+		s.nextProbe = until
+	}
+	return true
+}
+
+func (s *session) rejection() (int, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.blocked {
+		return s.rejectedStatus, 0
+	}
+	if time.Now().Before(s.retryUntil) {
+		return 429, int(time.Until(s.retryUntil).Seconds()) + 1
+	}
+	return 0, 0
+}
+
 func (e *Engine) Status() map[string]any {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	states := make([]turnstate.Status, 0, len(e.sessions))
+	type sessionStatus struct {
+		turnstate.Status
+		Phase             string `json:"phase"`
+		RejectedStatus    int    `json:"rejected_status,omitempty"`
+		RetryAfterSeconds int    `json:"retry_after_seconds,omitempty"`
+	}
+	states := make([]sessionStatus, 0, len(e.sessions))
 	for _, s := range e.sessions {
-		states = append(states, s.state.Status(time.Now()))
+		state := s.state.Status(time.Now())
+		status, retry := s.rejection()
+		phase := "collecting"
+		switch {
+		case status == 401 || status == 403:
+			phase = "auth_blocked"
+		case status == 429:
+			phase = "rate_limited"
+		case state.Usable:
+			phase = "ready"
+		default:
+			s.mu.Lock()
+			if s.probing == nil {
+				phase = "waiting_for_state"
+			}
+			s.mu.Unlock()
+		}
+		states = append(states, sessionStatus{state, phase, status, retry})
 	}
 	return map[string]any{"model": settings.Model, "routes": len(e.routes), "sessions": states, "state_storage": "memory", "transport": "http-sse"}
 }

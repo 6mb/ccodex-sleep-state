@@ -2,7 +2,7 @@
 
 准备好已经登录的 Codex，以及你自己的订阅或代理。下面按第一次使用来写，不需要装 Go，也不用管理员权限。
 
-先说明当前进度：这是早期测试版，跑通本地测试不等于所有人的 Codex 都能接上。第一次先用一个简单问题验证，别直接拿正在赶工的长任务试。最新结果看[测试记录](testing.md)。
+先说明当前进度：这是早期测试版，真实 macOS CLI 链路已经测通，但不等于所有人的 Windows 桌面客户端都已验证。第一次先用一个简单问题验证，别直接拿正在赶工的长任务试。最新结果看[测试记录](testing.md)。
 
 ## 1. 放好程序
 
@@ -78,7 +78,9 @@ notepad "$env:LOCALAPPDATA\ccodex-sleep-state\config.json"
 
 - `routes`：可用配置中的出口数量，不代表每个出口已经联网成功。
 - `sessions`：服务在内存中记住的凭据会话；刚启动时为空是正常的。
-- `usable`：当前 state 是否符合配置的封装/时间基线，不是智力评分。
+- `phase`：`ready` 表示可以转发；`waiting_for_state` 表示还没采到，`auth_blocked` 表示认证被拒，`rate_limited` 表示正在等待限流恢复。
+- `usable`：当前 state 是否符合配置的封装/时间基线，不是智力评分；是否能继续请求还要看 `phase`。
+- `retry_after_seconds`：收到限流后还需等待的秒数。
 - `ready`：有没有仍在有效期内的备用值。
 - `remaining_seconds`：按配置 TTL 算出的估计剩余时间，不是上游承诺。
 - `strikes`：当前版本连续出现非基线形状的次数。

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -144,13 +145,17 @@ func Load(ctx context.Context, c settings.Config) ([]Route, error) {
 			}
 			raw = os.Getenv(source.URLEnv)
 		}
-		data, err := fetch(ctx, client, raw)
+		data, err := fetch(ctx, client, raw, source.UserAgent)
 		if err != nil {
 			return nil, fmt.Errorf("subscription %d: %w", i+1, err)
 		}
 		nodes, err := Parse(data)
 		if err != nil {
 			return nil, fmt.Errorf("subscription %d: %w", i+1, err)
+		}
+		nodes = filterNodes(nodes, source)
+		if len(nodes) == 0 {
+			return nil, fmt.Errorf("subscription %d: no nodes remain after filters", i+1)
 		}
 		if err = add(nodes); err != nil {
 			return nil, err
@@ -163,7 +168,7 @@ func Load(ctx context.Context, c settings.Config) ([]Route, error) {
 	return routes, nil
 }
 
-func fetch(ctx context.Context, client *http.Client, raw string) ([]byte, error) {
+func fetch(ctx context.Context, client *http.Client, raw, userAgent string) ([]byte, error) {
 	u, err := url.Parse(raw)
 	if err != nil || u.Hostname() == "" || u.User != nil || (u.Scheme != "https" && !(u.Scheme == "http" && settings.IsLoopback(u.Hostname()))) {
 		return nil, errors.New("subscription must be an HTTPS URL (loopback HTTP is allowed for tests)")
@@ -172,7 +177,10 @@ func fetch(ctx context.Context, client *http.Client, raw string) ([]byte, error)
 	if err != nil {
 		return nil, errors.New("invalid subscription URL")
 	}
-	req.Header.Set("User-Agent", "ccodex-sleep-state/1")
+	if userAgent == "" {
+		userAgent = "ccodex-sleep-state/1"
+	}
+	req.Header.Set("User-Agent", userAgent)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, errors.New("download failed; check connectivity and subscription validity")
@@ -189,4 +197,36 @@ func fetch(ctx context.Context, client *http.Client, raw string) ([]byte, error)
 		return nil, errors.New("subscription exceeds 2 MiB")
 	}
 	return data, nil
+}
+
+// Filtering precedes adapter construction: excluded nodes never dial anything.
+// Keywords refer to subscription labels/addresses, not verified exit geography.
+func filterNodes(nodes []map[string]any, source settings.Source) []map[string]any {
+	selected := make([]map[string]any, 0, len(nodes))
+	for _, node := range nodes {
+		protocol, _ := node["type"].(string)
+		if len(source.IncludeProtocols) > 0 {
+			matched := false
+			for _, allowed := range source.IncludeProtocols {
+				matched = matched || strings.EqualFold(protocol, allowed)
+			}
+			if !matched {
+				continue
+			}
+		}
+		name, _ := node["name"].(string)
+		host, _ := node["server"].(string)
+		label := strings.ToLower(name + " " + host)
+		excluded := false
+		for _, word := range source.ExcludeKeywords {
+			if strings.Contains(label, strings.ToLower(word)) {
+				excluded = true
+				break
+			}
+		}
+		if !excluded {
+			selected = append(selected, node)
+		}
+	}
+	return selected
 }

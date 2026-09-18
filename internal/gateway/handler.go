@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,6 +38,9 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release(s)
+	if rejectRequest(w, s) {
+		return
+	}
 	if r.Method == http.MethodPost {
 		if encoding := r.Header.Get("Content-Encoding"); encoding != "" && encoding != "identity" {
 			fail(w, 415, "unsupported_encoding", "Send uncompressed JSON.")
@@ -71,8 +75,11 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	snapshot, usable := s.state.Acquire(time.Now())
 	if generation && !usable {
-		e.refresh(r.Context(), s)
+		e.refresh(r.Context(), s, true)
 		snapshot, usable = s.state.Acquire(time.Now())
+	}
+	if rejectRequest(w, s) {
+		return
 	}
 	if generation && !usable {
 		w.Header().Set("Retry-After", "30")
@@ -99,6 +106,7 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Transport: e.routes[route].Transport, FlushInterval: -1, ErrorLog: log.New(io.Discard, "", 0),
 		ModifyResponse: func(resp *http.Response) error {
 			resp.Header.Del("Set-Cookie")
+			e.reject(s, resp.StatusCode, retryDelay(resp.Header.Get("Retry-After")), route)
 			if generation && resp.StatusCode >= 200 && resp.StatusCode < 300 && s.state.Observe(resp.Header.Get(turnstate.Header), snapshot, time.Now()) {
 				// Never replay a generation request: it may already have run upstream.
 				resp.Body.Close()
@@ -121,6 +129,20 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}()
 	proxy.ServeHTTP(tracked, r)
 }
+func rejectRequest(w http.ResponseWriter, s *session) bool {
+	status, seconds := s.rejection()
+	if status == 0 {
+		return false
+	}
+	if status == 429 {
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		fail(w, status, "upstream_rate_limited", "Upstream requested a pause. No request or probe was sent; wait before retrying.")
+	} else {
+		fail(w, status, "upstream_auth_rejected", "Upstream rejected these credentials. Resolve login or access in Codex before retrying.")
+	}
+	return true
+}
+
 func fail(w http.ResponseWriter, status int, code, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")

@@ -1,0 +1,15 @@
+# 更新记录
+
+## v0.1.0-alpha.1
+
+首个公开测试版，目前只支持 Astra。
+
+- 一个 Go 服务完成订阅导入、state 采集、当前/备用状态维护和 HTTP/SSE 转发。
+- 自动备份并接管 Codex 配置；正常退出恢复，意外结束后可执行 `restore`。
+- 支持 AnyTLS，以及 HTTP、HTTPS、SOCKS5、SS、SSR、VMess、VLESS、Trojan、Hysteria、Hysteria2、TUIC 出站。
+- 订阅可指定下载客户端标识、选择协议、排除节点关键词；不关闭 TLS 校验。
+- 修复首条请求等待备用采集、正式请求的认证/限流错误未统一暂停等问题。
+- 默认 10 块规则下，从真实 AnyTLS 出口采到 292，连续两次 CLI 请求完成注入并收到回复。
+- 提供 Windows x64/ARM64、macOS Apple Silicon/Intel 包、对应源码和 SHA256；附中文教程及群聊入口。
+
+这是方法验证和早期使用版本，不保证改善降智或限流，也不会增加账号额度。Windows 桌面客户端完整联调、长期运行及回答质量对照仍待更多验证。详见 [测试记录](docs/testing.md)。

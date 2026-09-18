@@ -24,13 +24,16 @@ func Parse(data []byte) ([]map[string]any, error) {
 	}
 	data = bytes.TrimSpace(data)
 	var document struct {
-		Proxies []map[string]any `yaml:"proxies"`
+		Proxies *[]map[string]any `yaml:"proxies"`
 	}
-	if yaml.Unmarshal(data, &document) == nil && len(document.Proxies) > 0 {
-		if len(document.Proxies) > MaxNodes {
+	if yaml.Unmarshal(data, &document) == nil && document.Proxies != nil {
+		if len(*document.Proxies) == 0 {
+			return nil, errors.New("subscription has an empty proxies list; the server supplied no nodes")
+		}
+		if len(*document.Proxies) > MaxNodes {
 			return nil, errors.New("subscription exceeds 256 nodes")
 		}
-		return document.Proxies, nil
+		return *document.Proxies, nil
 	}
 	if !bytes.Contains(data, []byte("://")) {
 		var decoded []byte
@@ -107,7 +110,7 @@ func ParseURI(raw string) (map[string]any, error) {
 
 func validateNode(node map[string]any) error {
 	switch node["type"] {
-	case "http", "socks5", "ss", "ssr", "vmess", "vless", "trojan", "hysteria", "hysteria2", "tuic":
+	case "http", "socks5", "ss", "ssr", "vmess", "vless", "trojan", "hysteria", "hysteria2", "tuic", "anytls":
 	default:
 		return errors.New("unsupported protocol (see docs/proxies.md)")
 	}

@@ -48,6 +48,7 @@ func TestEncryptedURIAdapters(t *testing.T) {
 	QuietCore()
 	vmess, _ := json.Marshal(map[string]string{"v": "2", "ps": "private-name", "add": "127.0.0.1", "port": "443", "id": "00000000-0000-4000-8000-000000000001", "aid": "0", "net": "tcp", "type": "none", "tls": "tls"})
 	uris := []string{
+		"anytls://synthetic-password@127.0.0.1:443?sni=example.invalid#private",
 		"ss://" + base64.RawURLEncoding.EncodeToString([]byte("aes-128-gcm:synthetic-password")) + "@127.0.0.1:443#private",
 		"vmess://" + base64.StdEncoding.EncodeToString(vmess),
 		"vless://00000000-0000-4000-8000-000000000001@127.0.0.1:443?security=tls&type=tcp#private",
@@ -215,4 +216,55 @@ func socksHandshake(conn net.Conn) error {
 	}
 	_, err := conn.Write([]byte{5, 0, 0, 1, 127, 0, 0, 1, 0, 0})
 	return err
+}
+
+func TestEmptyClashTemplateReportsMissingNodes(t *testing.T) {
+	for _, raw := range []string{
+		"proxies: []\nproxy-groups: [{name: group, type: select, proxies: [DIRECT]}]\nrules: ['MATCH,DIRECT']\n",
+		`{"proxies":[],"rules":["MATCH,DIRECT"]}`,
+	} {
+		_, err := Parse([]byte(raw))
+		if err == nil || !strings.Contains(err.Error(), "empty proxies list") {
+			t.Fatalf("empty template was mistaken for an encoding error: %v", err)
+		}
+	}
+}
+
+func TestSubscriptionUserAgentSelectsNodeFormat(t *testing.T) {
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("User-Agent") != "custom-yaml-client" {
+			fmt.Fprint(w, "proxies: []\n")
+			return
+		}
+		fmt.Fprint(w, "proxies:\n- name: private\n  type: anytls\n  server: 127.0.0.1\n  port: 443\n  password: synthetic-password\n")
+	}))
+	defer source.Close()
+	c := settings.Default()
+	c.Direct = false
+	c.Subscriptions = []settings.Source{{URL: source.URL, UserAgent: "custom-yaml-client"}}
+	routes, err := Load(context.Background(), c)
+	if err != nil || len(routes) != 1 {
+		t.Fatalf("subscription format selection failed: %v", err)
+	}
+	for _, r := range routes {
+		r.Close()
+	}
+}
+
+func TestSubscriptionFiltersRunBeforeUnsafeNodeConstruction(t *testing.T) {
+	nodes := []map[string]any{
+		{"name": "香港", "type": "anytls", "server": "first.invalid"},
+		{"name": "台湾", "type": "anytls", "server": "second.invalid"},
+		{"name": "澳门", "type": "anytls", "server": "third.invalid"},
+		{"name": "Japan", "type": "anytls", "server": "fourth.invalid"},
+		{"name": "US", "type": "trojan", "server": "fifth.invalid", "skip-cert-verify": true},
+	}
+	source := settings.Source{IncludeProtocols: []string{"anytls"}, ExcludeKeywords: []string{"香港", "台湾", "澳门"}}
+	kept := filterNodes(nodes, source)
+	if len(kept) != 1 || kept[0]["name"] != "Japan" {
+		t.Fatal("excluded region or protocol survived filtering")
+	}
+	if nodes[4]["skip-cert-verify"] != true {
+		t.Fatal("filter mutated node security settings")
+	}
 }

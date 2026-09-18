@@ -18,8 +18,11 @@ const Model = "gpt-6-astra"
 const App = "ccodex-sleep-state"
 
 type Source struct {
-	URL    string `json:"url,omitempty"`
-	URLEnv string `json:"url_env,omitempty"`
+	URL              string   `json:"url,omitempty"`
+	URLEnv           string   `json:"url_env,omitempty"`
+	UserAgent        string   `json:"user_agent,omitempty"`
+	IncludeProtocols []string `json:"include_protocols,omitempty"`
+	ExcludeKeywords  []string `json:"exclude_keywords,omitempty"`
 }
 
 type Config struct {
@@ -86,6 +89,19 @@ func (c Config) Validate() error {
 	}
 	if c.TTLSeconds < 120 || c.TTLSeconds > 3600 || c.RefreshSeconds < 30 || c.RefreshSeconds >= c.TTLSeconds || c.BaselineBlocks < 1 || c.BaselineBlocks > 32 {
 		return errors.New("invalid state policy; refresh must be shorter than TTL (120–3600s)")
+	}
+	for _, source := range c.Subscriptions {
+		if len(source.IncludeProtocols) > 16 || len(source.ExcludeKeywords) > 64 {
+			return errors.New("too many subscription filter entries")
+		}
+		for _, keyword := range source.ExcludeKeywords {
+			if strings.TrimSpace(keyword) == "" || len(keyword) > 128 {
+				return errors.New("subscription exclude keyword must contain 1–128 bytes")
+			}
+		}
+		if len(source.UserAgent) > 256 || strings.ContainsAny(source.UserAgent, "\r\n") {
+			return errors.New("subscription user_agent must be one line, at most 256 bytes")
+		}
 	}
 	if len(c.ProxyURLs)+len(c.ProxyEnvs) > 256 || len(c.Subscriptions) > 16 {
 		return errors.New("too many proxy sources")

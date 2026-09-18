@@ -46,3 +46,17 @@ func TestStrictJSONAndPaths(t *testing.T) {
 		t.Fatal("Codex override ignored")
 	}
 }
+
+func TestSubscriptionHeaderAndFilterValidation(t *testing.T) {
+	for _, source := range []Source{
+		{UserAgent: "client\r\nAuthorization: secret"},
+		{ExcludeKeywords: []string{""}},
+		{ExcludeKeywords: make([]string, 65)},
+	} {
+		c := Default()
+		c.Subscriptions = []Source{source}
+		if c.Validate() == nil {
+			t.Fatal("invalid subscription option accepted")
+		}
+	}
+}

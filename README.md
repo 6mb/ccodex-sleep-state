@@ -10,7 +10,7 @@
 
 [Windows 上手](docs/windows.md) · [macOS 上手](docs/macos.md) · [订阅和代理](docs/proxies.md) · [测试进展](docs/testing.md) · [群聊交流](#一起试一起反馈)
 
-> **当前是早期测试版，还不适合直接发给所有人当稳定版用。** 已跑通一次真实 Codex CLI → Astra 的 state 注入和回复，但默认筛选规则在这次测试的出口上没采到可用 state。问题和实际测试过程都写在[测试记录](docs/testing.md)里，没有用“链路通了”代替“降智解决了”。
+> **真实链路已经跑通，首版仍按公开测试版发布。** 保持默认 10 块规则，从真实 AnyTLS 出口采到 292 后，两次 Codex CLI 请求均完成注入并收到回复。Windows、macOS 的自动测试与实际使用验证分开记录，见[测试记录](docs/testing.md)。
 
 ## 适合谁用
 
@@ -71,7 +71,7 @@ Mac 用户看 [macOS 教程](docs/macos.md)，命令前缀换成 `./ccodex-sleep
 
 ## 用之前知道这几件事
 
-- **采集会用到模型额度。** 默认每轮最多试 6 个出口，找到两份合格候选就停；同一轮不会重复试同一个出口。单次探测最多 20 秒，两轮至少间隔 180 秒。
+- **采集会用到模型额度。** 默认每轮最多试 6 个出口，首条请求拿到一份合格 state 就继续转发，备用值留到后台补；同一轮不会重复试同一个出口。单次探测最多 20 秒，两轮至少间隔 180 秒。
 - **不会不停重发你的问题。** 正常生成请求不由本服务自动重放。遇到 401、403、429 会停止本轮探测；权限、额度和速率限制需要分别处理。
 - **目前只走 HTTP / SSE。** 暂不支持 WebSocket，也不支持其他模型。
 - **改了订阅要重启服务。** 现在只在启动或 `check` 时下载订阅，不做后台热更新。
@@ -81,7 +81,7 @@ Mac 用户看 [macOS 教程](docs/macos.md)，命令前缀换成 `./ccodex-sleep
 
 订阅支持 Clash/Mihomo YAML、逐行 URI 和 Base64 URI 列表。已有代理软件的，可以直接填它的 HTTP、HTTPS 或 SOCKS5 地址，支持用户名密码。
 
-订阅中的 SS、SSR、VMess、VLESS、Trojan、Hysteria、Hysteria2、TUIC 由内嵌的 Mihomo 出站适配器处理，不需要另起代理核心。这里只读取节点，不导入订阅里的规则、DNS、TUN 或代理组。
+订阅中的 AnyTLS、SS、SSR、VMess、VLESS、Trojan、Hysteria、Hysteria2、TUIC 由内嵌的 Mihomo 出站适配器处理，不需要另起代理核心。这里只读取节点，不导入订阅里的规则、DNS、TUN 或代理组。
 
 协议实现支持与真实节点跑通是两回事。具体格式、例子和限制见[代理教程](docs/proxies.md)。
 

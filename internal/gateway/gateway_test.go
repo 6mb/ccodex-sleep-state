@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -70,6 +71,14 @@ func TestBootstrapInjectAndPreserveBody(t *testing.T) {
 			if bytes.Contains(body, []byte("private prompt")) {
 				t.Error("probe contained conversation")
 			}
+			var probe map[string]any
+			if json.Unmarshal(body, &probe) != nil || probe["parallel_tool_calls"] != true || probe["reasoning"] != nil {
+				t.Error("probe changed the protocol or forced a reasoning effort")
+			}
+			include, ok := probe["include"].([]any)
+			if !ok || len(include) != 1 || include[0] != "reasoning.encrypted_content" {
+				t.Error("missing Codex response include field")
+			}
 			complete(w, token)
 			return
 		}
@@ -112,7 +121,7 @@ func TestQuotaFailureStopsProbeRoundAndCooldown(t *testing.T) {
 			for i := 0; i < 2; i++ {
 				w := httptest.NewRecorder()
 				e.ServeHTTP(w, request(generation, "synthetic-account-token"))
-				if w.Code != 503 {
+				if w.Code != status {
 					t.Fatalf("status=%d", w.Code)
 				}
 			}
@@ -376,5 +385,82 @@ func TestExplicitBaselineInjectsAndAllowsMissingResponseState(t *testing.T) {
 	}
 	if injected.Load() != 2 {
 		t.Fatal("missing response header must not discard the active state")
+	}
+}
+
+func TestBootstrapDoesNotWaitForBackupRoutes(t *testing.T) {
+	var calls atomic.Int32
+	e, _ := testEngine(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		complete(w, fakeToken(10, 1))
+	}))
+	e.routes = append(e.routes, e.routes[0], e.routes[0])
+	w := httptest.NewRecorder()
+	e.ServeHTTP(w, request(generation, "synthetic-account-token"))
+	if w.Code != 200 || calls.Load() != 2 {
+		t.Fatalf("first request must need only one probe plus generation: status=%d calls=%d", w.Code, calls.Load())
+	}
+}
+
+func TestGenerationRejectionPausesRequestsAndProbes(t *testing.T) {
+	for _, status := range []int{401, 403, 429} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var calls atomic.Int32
+			e, _ := testEngine(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.Header.Get(turnstate.Header) == "" {
+					complete(w, fakeToken(10, 1))
+					return
+				}
+				w.Header().Set("Retry-After", "3600")
+				w.WriteHeader(status)
+			}))
+			for i := 0; i < 2; i++ {
+				w := httptest.NewRecorder()
+				e.ServeHTTP(w, request(generation, "synthetic-account-token"))
+				if w.Code != status {
+					t.Fatalf("got %d want %d", w.Code, status)
+				}
+				if status == 429 && w.Header().Get("Retry-After") == "" {
+					t.Fatal("missing retry delay")
+				}
+			}
+			for _, s := range e.sessions {
+				e.refresh(context.Background(), s, false)
+			}
+			if calls.Load() != 2 {
+				t.Fatal("request or probe escaped upstream rejection")
+			}
+		})
+	}
+}
+
+func TestDefaultBaselineSkipsMismatchedRouteAndBindsGoodRoute(t *testing.T) {
+	var badCalls, goodCalls atomic.Int32
+	e, _ := testEngine(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		badCalls.Add(1)
+		if r.Header.Get(turnstate.Header) != "" {
+			t.Error("generation used the rejected route")
+		}
+		complete(w, fakeToken(11, 1))
+	}))
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		goodCalls.Add(1)
+		if v := r.Header.Get(turnstate.Header); v != "" && v != fakeToken(10, 2) {
+			t.Error("wrong state injected on good route")
+		}
+		complete(w, fakeToken(10, 2))
+	}))
+	defer good.Close()
+	// The second transport dials our second synthetic egress while preserving
+	// the upstream URL. This tests actual route selection rather than a counter.
+	tr := &http.Transport{DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, strings.TrimPrefix(good.URL, "http://"))
+	}}
+	e.routes = append(e.routes, proxyroute.Route{ID: "good-route", Transport: tr})
+	w := httptest.NewRecorder()
+	e.ServeHTTP(w, request(generation, "synthetic-account-token"))
+	if w.Code != 200 || badCalls.Load() != 1 || goodCalls.Load() != 2 {
+		t.Fatalf("wrong selection: status=%d bad=%d good=%d", w.Code, badCalls.Load(), goodCalls.Load())
 	}
 }
