@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -30,6 +31,14 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	passthrough := (r.Method == http.MethodGet && r.URL.Path == "/backend-api/codex/models") || (r.Method == http.MethodPost && r.URL.Path == "/backend-api/codex/alpha/search")
 	if !generation && !passthrough {
 		fail(w, http.StatusNotFound, "unsupported_endpoint", "Endpoint is not exposed by this service.")
+		return
+	}
+	if e.config.IsRelay() && officialCredential(r.Header.Get("Authorization")) {
+		fail(w, http.StatusUnauthorized, "official_credentials_on_relay", "检测到官方登录凭据，已阻止发送给中转站。请为当前中转配置独立 API key。")
+		return
+	}
+	if len(e.routes) == 0 {
+		fail(w, 503, "no_routes", "没有可用出口。请在管理面板添加本地代理、订阅或启用直连。")
 		return
 	}
 	s, err := e.borrow(r.Header)
@@ -68,26 +77,40 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		r.ContentLength = int64(len(body))
 	}
-	if generation {
+	inject := generation && !e.disabled.Load()
+	if inject {
 		s.mu.Lock()
 		s.activated = true
 		s.mu.Unlock()
 	}
 	snapshot, usable := s.state.Acquire(time.Now())
-	if generation && !usable {
+	if inject && !usable {
 		e.refresh(r.Context(), s, true)
 		snapshot, usable = s.state.Acquire(time.Now())
 	}
 	if rejectRequest(w, s) {
 		return
 	}
-	if generation && !usable {
+	if inject && !usable {
 		w.Header().Set("Retry-After", "30")
-		fail(w, 503, "state_unavailable", "No usable state. Check service status and proxy connectivity; probes are rate-limited.")
+		fail(w, 503, "state_unavailable", "尚未采到合格 state。这是本地拦截，不是上游 503。请打开管理面板检查出口，或明确关闭注入后使用普通转发；探测有冷却时间。")
 		return
 	}
 	route := 0
-	if usable {
+	if e.config.PinnedRoute != "" {
+		found := false
+		for i := range e.routes {
+			if e.routes[i].ID == e.config.PinnedRoute {
+				route, found = i, true
+				break
+			}
+		}
+		if !found {
+			fail(w, 503, "pinned_route_unavailable", "指定出口不存在，请在路由页面重新选择。")
+			return
+		}
+	}
+	if inject && usable {
 		route = snapshot.Route
 	}
 	target, _ := url.Parse(e.config.Upstream)
@@ -95,19 +118,36 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.Out.URL.Scheme = target.Scheme
 			pr.Out.URL.Host = target.Host
+			pr.Out.URL.Path = strings.TrimRight(target.Path, "/") + strings.TrimPrefix(pr.In.URL.Path, "/backend-api/codex")
+			pr.Out.URL.RawPath = ""
 			pr.Out.Host = target.Host
 			pr.Out.Header.Del(turnstate.Header)
 			pr.Out.Header.Del("Cookie")
 			pr.Out.Header.Del("Proxy-Authorization")
-			if generation {
+			if e.config.IsRelay() {
+				for key := range pr.Out.Header {
+					if strings.HasPrefix(strings.ToLower(key), "chatgpt-") {
+						pr.Out.Header.Del(key)
+					}
+				}
+				pr.Out.Header.Del("Originator")
+				pr.Out.Header.Del("Version")
+			}
+			if inject {
 				pr.Out.Header.Set(turnstate.Header, snapshot.Token.Value)
 			}
 		},
 		Transport: e.routes[route].Transport, FlushInterval: -1, ErrorLog: log.New(io.Discard, "", 0),
 		ModifyResponse: func(resp *http.Response) error {
 			resp.Header.Del("Set-Cookie")
+			if e.config.IsRelay() {
+				resp.Header.Del(turnstate.Header)
+			}
+			if resp.StatusCode == 503 {
+				resp.Header.Set("X-Sleep-State-Error-Source", "upstream")
+			}
 			e.reject(s, resp.StatusCode, retryDelay(resp.Header.Get("Retry-After")), route)
-			if generation && resp.StatusCode >= 200 && resp.StatusCode < 300 && s.state.Observe(resp.Header.Get(turnstate.Header), snapshot, time.Now()) {
+			if inject && resp.StatusCode >= 200 && resp.StatusCode < 300 && s.state.Observe(resp.Header.Get(turnstate.Header), snapshot, time.Now()) {
 				// Never replay a generation request: it may already have run upstream.
 				resp.Body.Close()
 				return errShape
@@ -144,6 +184,7 @@ func rejectRequest(w http.ResponseWriter, s *session) bool {
 }
 
 func fail(w http.ResponseWriter, status int, code, message string) {
+	w.Header().Set("X-Sleep-State-Error-Source", "local")
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
@@ -187,4 +228,29 @@ func ProtectLocal(host string, next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// An OAuth access token must never be mistaken for a relay API key. Claims here
+// are only a fail-closed leak check, not authentication or signature validation.
+func officialCredential(auth string) bool {
+	token := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return false
+	}
+	var claims map[string]json.RawMessage
+	if json.Unmarshal(payload, &claims) != nil {
+		return false
+	}
+	if _, ok := claims["https://api.openai.com/auth"]; ok {
+		return true
+	}
+	var issuer string
+	_ = json.Unmarshal(claims["iss"], &issuer)
+	u, err := url.Parse(issuer)
+	return err == nil && (u.Hostname() == "auth.openai.com" || u.Hostname() == "auth0.openai.com")
 }

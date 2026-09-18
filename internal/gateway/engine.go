@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gylive/ccodex-sleep-state/internal/proxyroute"
@@ -39,16 +40,20 @@ type session struct {
 }
 
 type Engine struct {
-	config    settings.Config
-	routes    []proxyroute.Route
-	log       *slog.Logger
-	mu        sync.Mutex
-	sessions  map[string]*session
-	probeSlot chan struct{}
+	injectionEpoch atomic.Uint64
+	disabled       atomic.Bool
+	config         settings.Config
+	routes         []proxyroute.Route
+	log            *slog.Logger
+	mu             sync.Mutex
+	sessions       map[string]*session
+	probeSlot      chan struct{}
 }
 
 func New(c settings.Config, routes []proxyroute.Route, logger *slog.Logger) *Engine {
-	return &Engine{config: c, routes: routes, log: logger, sessions: make(map[string]*session), probeSlot: make(chan struct{}, 1)}
+	e := &Engine{config: c, routes: routes, log: logger, sessions: make(map[string]*session), probeSlot: make(chan struct{}, 1)}
+	e.disabled.Store(c.InjectionDisabled || c.IsRelay())
+	return e
 }
 func (e *Engine) borrow(h http.Header) (*session, error) {
 	auth := h.Get("Authorization")
@@ -100,6 +105,9 @@ func (e *Engine) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
+			if e.disabled.Load() {
+				continue
+			}
 			e.mu.Lock()
 			var work []*session
 			for key, s := range e.sessions {
@@ -127,6 +135,10 @@ func (e *Engine) Run(ctx context.Context) {
 }
 
 func (e *Engine) refresh(ctx context.Context, s *session, bootstrap bool) {
+	epoch := e.injectionEpoch.Load()
+	if e.disabled.Load() {
+		return
+	}
 	s.mu.Lock()
 	if pending := s.probing; pending != nil {
 		s.mu.Unlock()
@@ -160,8 +172,22 @@ func (e *Engine) refresh(ctx context.Context, s *session, bootstrap bool) {
 		return
 	}
 	successes := 0
-	for i := 0; i < e.config.MaxProbes && i < len(e.routes); i++ {
-		if ctx.Err() != nil {
+	limit := min(e.config.MaxProbes, len(e.routes))
+	pinned := -1
+	if e.config.PinnedRoute != "" {
+		for i := range e.routes {
+			if e.routes[i].ID == e.config.PinnedRoute {
+				pinned = i
+				break
+			}
+		}
+		if pinned < 0 {
+			return
+		}
+		limit = 1
+	}
+	for i := 0; i < limit; i++ {
+		if ctx.Err() != nil || e.disabled.Load() || e.injectionEpoch.Load() != epoch {
 			return
 		}
 		s.mu.Lock()
@@ -172,9 +198,12 @@ func (e *Engine) refresh(ctx context.Context, s *session, bootstrap bool) {
 		route := s.cursor % len(e.routes)
 		s.cursor++
 		s.mu.Unlock()
+		if pinned >= 0 {
+			route = pinned
+		}
 		token, status, retryAfter, err := e.probe(ctx, s.headers, e.routes[route])
 		accepted := false
-		if err == nil {
+		if err == nil && !e.disabled.Load() && e.injectionEpoch.Load() == epoch {
 			accepted = s.state.Offer(token, route, time.Now())
 		}
 		result := "request_failed"
@@ -318,6 +347,8 @@ func (e *Engine) Status() map[string]any {
 			phase = "auth_blocked"
 		case status == 429:
 			phase = "rate_limited"
+		case e.disabled.Load():
+			phase = "passthrough"
 		case state.Usable:
 			phase = "ready"
 		default:
@@ -329,7 +360,13 @@ func (e *Engine) Status() map[string]any {
 		}
 		states = append(states, sessionStatus{state, phase, status, retry})
 	}
-	return map[string]any{"model": settings.Model, "routes": len(e.routes), "sessions": states, "state_storage": "memory", "transport": "http-sse"}
+	kind, reason := "official", ""
+	if e.config.IsRelay() {
+		kind, reason = "relay", "中转站使用普通转发，不采集或注入官方 turn-state。"
+	} else if e.disabled.Load() {
+		reason = "已关闭注入；请求按原样转发，不采集 state。"
+	}
+	return map[string]any{"upstream_kind": kind, "injection_reason": reason, "injection_enabled": !e.disabled.Load(), "model": settings.Model, "routes": len(e.routes), "sessions": states, "state_storage": "memory", "transport": "http-sse"}
 }
 func (e *Engine) Close() {
 	for _, r := range e.routes {
@@ -347,4 +384,23 @@ func retryDelay(value string) time.Duration {
 		}
 	}
 	return 0
+}
+
+// SetInjection changes future requests only; an in-flight generation keeps its
+// immutable decision. Account rejections survive toggling injection.
+func (e *Engine) SetInjection(enabled bool) {
+	disabled := !enabled || e.config.IsRelay()
+	if e.disabled.Swap(disabled) != disabled {
+		e.injectionEpoch.Add(1)
+	}
+}
+func (e *Engine) Restricted() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, s := range e.sessions {
+		if status, _ := s.rejection(); status != 0 {
+			return true
+		}
+	}
+	return false
 }

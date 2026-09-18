@@ -2,7 +2,10 @@ package proxyroute
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,7 +15,9 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/gylive/ccodex-sleep-state/internal/settings"
 	"github.com/metacubex/mihomo/adapter"
@@ -23,9 +28,14 @@ import (
 // A route is immutable once loaded. States refer to its index, so a request
 // uses the same egress that supplied its state. Reloads require a restart.
 type Route struct {
-	ID        string
-	Transport *http.Transport
-	close     func() error
+	ID string
+	// StableID identifies connection settings, independent of list order or display name.
+	StableID string
+	// DisplayName and Protocol are for the authenticated local panel, never logs.
+	DisplayName string
+	Protocol    string
+	Transport   *http.Transport
+	close       func() error
 }
 
 var quietOnce sync.Once
@@ -57,6 +67,10 @@ func Build(node map[string]any, index int) (Route, error) {
 	for k, v := range node {
 		copyNode[k] = v
 	}
+	stableID, err := nodeIdentity(copyNode)
+	if err != nil {
+		return Route{}, err
+	}
 	copyNode["name"] = id
 	proxy, err := adapter.ParseProxy(copyNode)
 	if err != nil {
@@ -74,7 +88,52 @@ func Build(node map[string]any, index int) (Route, error) {
 		}
 		return conn, nil
 	}
-	return Route{ID: id, Transport: tr, close: proxy.Close}, nil
+	protocol, _ := node["type"].(string)
+	return Route{ID: id, StableID: stableID, DisplayName: nodeDisplayName(node, protocol), Protocol: protocol, Transport: tr, close: proxy.Close}, nil
+}
+
+// Labels come only from a subscription's explicit display name, never from
+// its address or credentials. URI-like names are replaced rather than redacted.
+func nodeDisplayName(node map[string]any, protocol string) string {
+	name, _ := node["name"].(string)
+	name = strings.TrimSpace(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, name))
+	fallback := protocol + " 线路"
+	if name == "" || name == "imported" || strings.Contains(name, "://") || strings.Contains(name, "@") {
+		return fallback
+	}
+	for _, key := range []string{"server", "password", "username", "uuid"} {
+		value, _ := node[key].(string)
+		if value != "" && strings.Contains(name, value) {
+			return fallback
+		}
+	}
+	runes := []rune(name)
+	if len(runes) > 80 {
+		name = string(runes[:80])
+	}
+	return name
+}
+
+// JSON encoding sorts map keys; display labels never change a pinned endpoint.
+// Only the digest is exposed: raw addresses and credentials stay private.
+func nodeIdentity(node map[string]any) (string, error) {
+	canonical := make(map[string]any, len(node))
+	for key, value := range node {
+		if key != "name" {
+			canonical[key] = value
+		}
+	}
+	data, err := json.Marshal(canonical)
+	if err != nil {
+		return "", errors.New("node settings cannot be canonicalized")
+	}
+	digest := sha256.Sum256(data)
+	return "route-" + hex.EncodeToString(digest[:16]), nil
 }
 
 func Load(ctx context.Context, c settings.Config) ([]Route, error) {
@@ -89,8 +148,9 @@ func Load(ctx context.Context, c settings.Config) ([]Route, error) {
 		}
 	}()
 	if c.Direct {
-		routes = append(routes, Route{ID: "direct", Transport: baseTransport()})
+		routes = append(routes, Route{ID: "direct", StableID: "direct", DisplayName: "直连", Protocol: "direct", Transport: baseTransport()})
 	}
+	seen := make(map[string]bool)
 	add := func(nodes []map[string]any) error {
 		for _, node := range nodes {
 			if len(routes) >= MaxNodes {
@@ -100,6 +160,12 @@ func Load(ctx context.Context, c settings.Config) ([]Route, error) {
 			if err != nil {
 				return fmt.Errorf("node %d: %w", len(routes)+1, err)
 			}
+			route.ID = route.StableID
+			if seen[route.ID] {
+				route.Close()
+				continue
+			}
+			seen[route.ID] = true
 			routes = append(routes, route)
 		}
 		return nil
@@ -145,7 +211,16 @@ func Load(ctx context.Context, c settings.Config) ([]Route, error) {
 			}
 			raw = os.Getenv(source.URLEnv)
 		}
-		data, err := fetch(ctx, client, raw, source.UserAgent)
+		var data []byte
+		var err error
+		if source.File != "" {
+			if raw != "" || source.URLEnv != "" {
+				return nil, errors.New("local file cannot be combined with a subscription URL")
+			}
+			data, err = readLocal(source.File)
+		} else {
+			data, err = fetch(ctx, client, raw, source.UserAgent)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("subscription %d: %w", i+1, err)
 		}
@@ -229,4 +304,36 @@ func filterNodes(nodes []map[string]any, source settings.Source) []map[string]an
 		}
 	}
 	return selected
+}
+
+// readLocal reads only an explicitly selected regular subscription file. Never
+// open a named pipe, device, or symlink supplied as a subscription.
+func readLocal(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return nil, errors.New("local subscription must be an existing regular file")
+	}
+	if info.Size() > MaxSubscriptionBytes {
+		return nil, errors.New("subscription exceeds 2 MiB")
+	}
+	// Nonblocking open prevents a file swapped for a FIFO between Lstat and
+	// Open from hanging. Windows treats this flag as a no-op for regular files.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, errors.New("cannot open local subscription")
+	}
+	defer f.Close()
+	opened, err := f.Stat()
+	current, pathErr := os.Lstat(path)
+	if err != nil || pathErr != nil || !opened.Mode().IsRegular() || !current.Mode().IsRegular() || !os.SameFile(info, opened) || !os.SameFile(opened, current) {
+		return nil, errors.New("local subscription changed while opening; select the file again")
+	}
+	if opened.Size() > MaxSubscriptionBytes {
+		return nil, errors.New("subscription exceeds 2 MiB")
+	}
+	data, err := io.ReadAll(io.LimitReader(f, MaxSubscriptionBytes+1))
+	if err != nil || len(data) > MaxSubscriptionBytes {
+		return nil, errors.New("cannot read local subscription within 2 MiB limit")
+	}
+	return data, nil
 }

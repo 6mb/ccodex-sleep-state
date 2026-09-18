@@ -18,6 +18,7 @@ const Model = "gpt-6-astra"
 const App = "ccodex-sleep-state"
 
 type Source struct {
+	File             string   `json:"file,omitempty"`
 	URL              string   `json:"url,omitempty"`
 	URLEnv           string   `json:"url_env,omitempty"`
 	UserAgent        string   `json:"user_agent,omitempty"`
@@ -26,6 +27,11 @@ type Source struct {
 }
 
 type Config struct {
+	UpstreamMode         string   `json:"upstream_mode,omitempty"`
+	UpstreamKind         string   `json:"upstream_kind,omitempty"`
+	CodexProfile         string   `json:"codex_profile,omitempty"`
+	InjectionDisabled    bool     `json:"injection_disabled,omitempty"`
+	PinnedRoute          string   `json:"pinned_route,omitempty"`
 	Listen               string   `json:"listen"`
 	Upstream             string   `json:"upstream"`
 	CodexHome            string   `json:"codex_home,omitempty"`
@@ -43,7 +49,7 @@ type Config struct {
 }
 
 func Default() Config {
-	return Config{Listen: "127.0.0.1:17841", Upstream: "https://chatgpt.com/backend-api/codex", Direct: true,
+	return Config{UpstreamKind: "official", Listen: "127.0.0.1:17841", Upstream: "https://chatgpt.com/backend-api/codex", Direct: true,
 		ProxyURLs: []string{}, ProxyEnvs: []string{}, Subscriptions: []Source{}, ProbeSeconds: 20,
 		RefreshSeconds: 1200, CooldownSeconds: 180, MaxProbes: 6, TTLSeconds: 3600, BaselineBlocks: 10}
 }
@@ -68,6 +74,9 @@ func Load(path string) (Config, error) {
 }
 
 func (c Config) Validate() error {
+	if c.UpstreamMode != "" && c.UpstreamMode != "auto" && c.UpstreamMode != "manual" {
+		return errors.New("upstream_mode must be auto or manual")
+	}
 	host, port, err := net.SplitHostPort(c.Listen)
 	ip := net.ParseIP(host)
 	p, pe := strconv.Atoi(port)
@@ -81,7 +90,13 @@ func (c Config) Validate() error {
 	if u.Scheme != "https" && !(u.Scheme == "http" && IsLoopback(u.Hostname())) {
 		return errors.New("upstream must use HTTPS; HTTP is allowed only for a loopback test server")
 	}
-	if strings.TrimRight(u.Path, "/") != "/backend-api/codex" {
+	if c.UpstreamKind != "" && c.UpstreamKind != "official" && c.UpstreamKind != "relay" {
+		return errors.New("upstream_kind must be official or relay")
+	}
+	if u.RawPath != "" || strings.Contains(u.Path, "..") || strings.ContainsAny(u.Path, "\\\r\n") {
+		return errors.New("upstream base path must not contain escapes or traversal")
+	}
+	if !c.IsRelay() && strings.TrimRight(u.Path, "/") != "/backend-api/codex" {
 		return errors.New("upstream path must be /backend-api/codex")
 	}
 	if c.ProbeSeconds < 1 || c.ProbeSeconds > 60 || c.MaxProbes < 1 || c.MaxProbes > 20 || c.CooldownSeconds < 30 || c.CooldownSeconds > 3600 {
@@ -140,3 +155,6 @@ func (c Config) CodexDir() (string, error) {
 	}
 	return filepath.Join(home, ".codex"), nil
 }
+
+// IsRelay distinguishes user-selected API-key providers from the official login flow.
+func (c Config) IsRelay() bool { return c.UpstreamKind == "relay" }

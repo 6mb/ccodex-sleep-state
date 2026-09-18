@@ -86,3 +86,26 @@ GitHub Actions 在 Windows、macOS、Linux runner 上执行 `go vet`、全包竞
 - `result: "request_failed"`：连接、封装解析或 SSE 完成检查失败，结合状态码排查。
 
 `status` 的 `phase` 会区分等待 state、已就绪、认证暂停和限流等待。没有合格值时继续保持严格模式，不自动把 312 当成 292 使用。
+
+## v0.2.0-alpha.1：管理面板与配置兼容验收
+
+2026-09-18，在独立数据目录、独立 Codex Home 下完成：
+
+- 全部 Go 包的 `go test -race -count=1 ./...` 通过；`go vet ./...` 通过。
+- 面板的固定 Host、同源校验、管理口令、静态资源 CSP；无口令与跨站操作被拒绝。
+- 注入开关持久化、配置备份、外部编辑冲突、坏订阅不覆盖旧出口、本地文件只读、固定路由。
+- 后台探测临界时收到 429，切换路由仍被拒绝；不会靠重建引擎丢掉限流状态。
+- Codex provider/profile fixture 覆盖官方登录、中转 env_key、CCS API Key + requires_openai_auth、官方 API Key、外部配置或认证类型切换。
+- 真浏览器完成登录、注入开关、代理配置解析测试、路由列表；390px 窄屏无横向溢出。
+
+本轮授权最多 8 次真实 Astra 请求，实际使用 **4 次**：
+
+1. 短请求采集：HTTP 200，SSE 完整结束，获得默认 10 块 / 292 长度 state。
+2. 两次独立 Codex CLI 请求：都带该 state、使用同一出口，HTTP 200、完整结束、回复 OK、CLI 退出码 0。
+3. 通过管理 API 关闭注入，再发一次 Codex CLI 请求：没有注入 state，HTTP 200、完整结束、回复 OK、CLI 退出码 0。
+
+真实验收前后，原 Codex 配置、登录文件和代理配置哈希一致。测试目录的临时登录副本已删除，隔离配置已恢复；没有刷新登录、切换系统代理或使用重置卡。
+
+**结论边界：**这证明本轮所用链路可采集、注入、关闭注入后正常转发，不证明降智已消失，不保证每个订阅都能取得 292。CCS / 中转兼容不等于对所有第三方中转站、所有 Windows 桌面客户端做过真实验收。
+
+另用实际 Codex CLI 连接本地模拟中转，验收两种配置：`env_key` 与 CCS 常见的 `requires_openai_auth=true` + `auth.json` API Key。两组均自动接管原 `/v1` provider，正确传递 API Key，不带 ChatGPT 账号头或 turn-state，收到完整 SSE、回复 OK、退出码 0；停止后原配置恢复。此测试未使用真实登录、未访问第三方中转、未消耗模型额度。

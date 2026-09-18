@@ -24,6 +24,10 @@ func digest(b []byte) string    { h := sha256.Sum256(b); return hex.EncodeToStri
 func journal(dir string) string { return filepath.Join(dir, "config-transaction.json") }
 
 func Install(dir, codexHome, baseURL string) error {
+	return InstallWithOptions(dir, codexHome, baseURL, Options{})
+}
+
+func InstallWithOptions(dir, codexHome, baseURL string, options Options) error {
 	if _, err := os.Stat(journal(dir)); err == nil {
 		return errors.New("unfinished config transaction; run restore before starting again")
 	} else if !os.IsNotExist(err) {
@@ -45,7 +49,7 @@ func Install(dir, codexHome, baseURL string) error {
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	updated, err := Patch(original, baseURL)
+	updated, err := PatchWithOptions(original, baseURL, options)
 	if err != nil {
 		return err
 	}
@@ -117,4 +121,25 @@ func Restore(dir string) error {
 		return err
 	}
 	return os.Remove(journal(dir))
+}
+
+// CheckManaged is a read-only guard for a running service. A configuration
+// manager switching providers requires a fresh attach, not an automatic rewrite.
+func CheckManaged(dir string) error {
+	data, err := os.ReadFile(journal(dir))
+	if err != nil {
+		return errors.New("managed Codex configuration receipt is unavailable; reconnect Codex")
+	}
+	var r receipt
+	if json.Unmarshal(data, &r) != nil || r.Target == "" || r.Installed == "" {
+		return errors.New("invalid managed Codex configuration receipt")
+	}
+	if err = fsutil.RefuseLink(r.Target); err != nil {
+		return err
+	}
+	current, err := os.ReadFile(r.Target)
+	if err != nil || digest(current) != r.Installed {
+		return errors.New("Codex configuration changed outside this service; reconnect after switching providers")
+	}
+	return nil
 }

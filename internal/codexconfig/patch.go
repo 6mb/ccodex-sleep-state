@@ -23,6 +23,17 @@ type edit struct {
 }
 
 func Patch(original []byte, baseURL string) ([]byte, error) {
+	return PatchWithOptions(original, baseURL, Options{})
+}
+
+func PatchWithOptions(original []byte, baseURL string, options Options) ([]byte, error) {
+	if options.ExpectedConfigSHA256 != "" && digest(original) != options.ExpectedConfigSHA256 {
+		return nil, errors.New("Codex configuration changed after provider selection; reconnect using the new configuration")
+	}
+	selection, err := ResolveWithAuth(original, options.Profile, options.AuthMode)
+	if err != nil {
+		return nil, err
+	}
 	var document map[string]any
 	if toml.Unmarshal(original, &document) != nil {
 		return nil, errors.New("Codex config is not valid TOML; left unchanged")
@@ -37,13 +48,24 @@ func Patch(original []byte, baseURL string) ([]byte, error) {
 	var parser unstable.Parser
 	parser.Reset(original)
 	root := true
+	var table []string
+	foundProfile := false
 	for parser.NextExpression() {
 		node := parser.Expression()
 		if node.Kind == unstable.Table || node.Kind == unstable.ArrayTable {
 			root = false
+			table = nil
+			keys := node.Key()
+			for keys.Next() {
+				table = append(table, string(keys.Node().Data))
+			}
+			if selection.Profile != "" && len(table) == 2 && table[0] == "profiles" && table[1] == selection.Profile {
+				root = true
+				foundProfile = true
+			}
 			continue
 		}
-		if !root || node.Kind != unstable.KeyValue {
+		if (selection.Profile != "" && len(table) == 0) || !root || node.Kind != unstable.KeyValue {
 			continue
 		}
 		keys := node.Key()
@@ -79,20 +101,67 @@ func Patch(original []byte, baseURL string) ([]byte, error) {
 			fmt.Fprintf(&prefix, "%s = %s\n", key, value)
 		}
 	}
-	updated = append([]byte(prefix.String()), updated...)
-	block := fmt.Sprintf(`
-
-# Managed while ccodex-sleep-state is running. Use its restore command after a crash.
-[model_providers.%s]
-name = "Sleep State (local)"
-base_url = %s
-wire_api = "responses"
-requires_openai_auth = true
-supports_websockets = false
-request_max_retries = 0
-stream_max_retries = 0
-`, provider, strconv.Quote(baseURL))
-	updated = append(updated, []byte(block)...)
+	if selection.Profile == "" {
+		updated = append([]byte(prefix.String()), updated...)
+	} else if prefix.Len() > 0 {
+		// Append missing keys inside the existing profile table, not at root.
+		if !foundProfile {
+			return nil, errors.New("selected profile must use an explicit TOML table; left unchanged")
+		}
+		var pp unstable.Parser
+		pp.Reset(updated)
+		insertion := len(updated)
+		inside := false
+		for pp.NextExpression() {
+			n := pp.Expression()
+			if n.Kind != unstable.Table && n.Kind != unstable.ArrayTable {
+				continue
+			}
+			var names []string
+			ks := n.Key()
+			tableStart := -1
+			for ks.Next() {
+				if tableStart < 0 {
+					tableStart = int(ks.Node().Raw.Offset)
+				}
+				names = append(names, string(ks.Node().Data))
+			}
+			if inside {
+				if tableStart < 0 {
+					return nil, errors.New("cannot locate profile boundary")
+				}
+				insertion = tableStart
+				for insertion > 0 && updated[insertion-1] != '\n' {
+					insertion--
+				}
+				break
+			}
+			inside = len(names) == 2 && names[0] == "profiles" && names[1] == selection.Profile
+		}
+		updated = append(append(append([]byte{}, updated[:insertion]...), []byte("\n"+prefix.String())...), updated[insertion:]...)
+	}
+	// Retain provider-specific authentication and request headers without reading
+	// their environment values. Never turn a relay into an official-auth provider.
+	managed := make(map[string]any)
+	for _, key := range []string{"env_key", "env_key_instructions", "experimental_bearer_token", "http_headers", "env_http_headers", "requires_openai_auth"} {
+		if value, ok := selection.fields[key]; ok {
+			managed[key] = value
+		}
+	}
+	managed["name"] = "Sleep State (local)"
+	managed["base_url"] = baseURL
+	managed["wire_api"] = "responses"
+	managed["supports_websockets"] = false
+	managed["request_max_retries"] = 0
+	managed["stream_max_retries"] = 0
+	block, err := toml.Marshal(map[string]any{"model_providers": map[string]any{provider: managed}})
+	if err != nil {
+		return nil, errors.New("cannot encode managed provider")
+	}
+	updated = append(updated, []byte("\n\n# Managed by ccodex-sleep-state; restore before changing providers.\n")...)
+	// The parent table may already be explicitly declared in the user file.
+	block = bytes.TrimPrefix(block, []byte("[model_providers]\n"))
+	updated = append(updated, block...)
 	if toml.Unmarshal(updated, &document) != nil {
 		return nil, errors.New("managed provider conflicts with existing TOML; left unchanged")
 	}

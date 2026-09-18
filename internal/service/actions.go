@@ -1,0 +1,249 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"github.com/gylive/ccodex-sleep-state/internal/proxyroute"
+	"github.com/gylive/ccodex-sleep-state/internal/settings"
+	"io"
+	"net/http"
+	"time"
+)
+
+func reply(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+func decode(w http.ResponseWriter, r *http.Request, v any) error {
+	d := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	d.DisallowUnknownFields()
+	if err := d.Decode(v); err != nil {
+		return errors.New("请求格式错误，或内容超过 1 MiB")
+	}
+	if d.Decode(new(any)) != io.EOF {
+		return errors.New("请求包含多余内容")
+	}
+	return nil
+}
+
+type sourceRequest struct {
+	Mode      string   `json:"mode"`
+	Value     string   `json:"value"`
+	UserAgent string   `json:"user_agent"`
+	Exclude   []string `json:"exclude_keywords"`
+	Protocols []string `json:"include_protocols"`
+}
+
+func (c *control) candidate(v sourceRequest) (settings.Config, error) {
+	next := c.config
+	next.Direct = false
+	next.ProxyURLs = []string{}
+	next.ProxyEnvs = []string{}
+	next.Subscriptions = []settings.Source{}
+	next.PinnedRoute = ""
+	source := settings.Source{UserAgent: v.UserAgent, ExcludeKeywords: v.Exclude, IncludeProtocols: v.Protocols}
+	switch v.Mode {
+	case "direct":
+		next.Direct = true
+	case "proxy":
+		next.ProxyURLs = []string{v.Value}
+	case "subscription":
+		source.URL = v.Value
+		next.Subscriptions = []settings.Source{source}
+	case "file":
+		source.File = v.Value
+		next.Subscriptions = []settings.Source{source}
+	default:
+		return next, errors.New("请选择直连、本地代理、订阅链接或本地订阅文件")
+	}
+	return next, next.Validate()
+}
+func closeRoutes(routes []proxyroute.Route) {
+	for _, r := range routes {
+		r.Close()
+	}
+}
+func routeList(routes []proxyroute.Route) []map[string]any {
+	result := make([]map[string]any, 0, len(routes))
+	for _, r := range routes {
+		result = append(result, map[string]any{"id": r.ID, "label": r.DisplayName, "protocol": r.Protocol})
+	}
+	return result
+}
+
+func (c *control) api(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/admin/api/status" && r.Method == "GET" {
+		reply(w, 200, c.status())
+		return
+	}
+	if r.Method != "POST" {
+		reply(w, 405, map[string]string{"error": "此操作需要 POST"})
+		return
+	}
+	// One management operation at a time. Never queue a chain of test requests.
+	if !c.action.TryLock() {
+		reply(w, 409, map[string]string{"error": "另一个管理操作还没完成，请稍后再试"})
+		return
+	}
+	defer c.action.Unlock()
+	if !c.mu.TryLock() {
+		reply(w, 409, map[string]string{"error": "Codex 正在处理请求，等这次回复结束后再操作"})
+		return
+	}
+	defer c.mu.Unlock()
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+	fail := func(err error) { reply(w, 400, map[string]string{"error": err.Error()}) }
+	switch r.URL.Path {
+	case "/admin/api/injection":
+		var v struct {
+			Enabled bool `json:"enabled"`
+		}
+		if err := decode(w, r, &v); err != nil {
+			fail(err)
+			return
+		}
+		if v.Enabled && c.effective().IsRelay() {
+			fail(errors.New("当前为 API / 中转通道，不支持官方 turn-state 注入"))
+			return
+		}
+		next := c.config
+		next.InjectionDisabled = !v.Enabled
+		if err := c.persist(next); err != nil {
+			fail(err)
+			return
+		}
+		c.config = next
+		if c.engine != nil {
+			c.engine.SetInjection(v.Enabled)
+		}
+		reply(w, 200, map[string]string{"message": "已保存。只影响之后的请求；关闭注入不会恢复 Codex 配置，仍通过此服务转发。"})
+	case "/admin/api/sources/test", "/admin/api/sources/apply":
+		var v sourceRequest
+		if err := decode(w, r, &v); err != nil {
+			fail(err)
+			return
+		}
+		next, err := c.candidate(v)
+		if err != nil {
+			fail(err)
+			return
+		}
+		routes, err := proxyroute.Load(ctx, next)
+		if err != nil {
+			fail(err)
+			return
+		}
+		if r.URL.Path == "/admin/api/sources/test" {
+			defer closeRoutes(routes)
+			reply(w, 200, map[string]any{"message": "订阅获取、解析和出站配置构建通过。尚未连接出口，也没有发送模型请求。", "routes": routeList(routes)})
+			return
+		}
+		c.pause()
+		defer c.resume()
+		if c.engine != nil && c.engine.Restricted() {
+			closeRoutes(routes)
+			reply(w, 409, map[string]string{"error": "上游登录、权限或限流拦截尚未解除。不能通过换出口继续请求。"})
+			return
+		}
+		if err = c.persist(next); err != nil {
+			closeRoutes(routes)
+			fail(err)
+			return
+		}
+		c.stop()
+		c.config = next
+		c.start(routes)
+		reply(w, 200, map[string]string{"message": "出口已应用，不需要重启服务。旧 state 已清空，下次 Codex 请求会按新出口重新采集。"})
+	case "/admin/api/routes", "/admin/api/routes/test", "/admin/api/routes/pin":
+		var v struct {
+			ID string `json:"id"`
+		}
+		if err := decode(w, r, &v); err != nil {
+			fail(err)
+			return
+		}
+		routes, err := proxyroute.Load(ctx, c.config)
+		if err != nil {
+			fail(err)
+			return
+		}
+		if r.URL.Path == "/admin/api/routes" {
+			defer closeRoutes(routes)
+			reply(w, 200, map[string]any{"routes": routeList(routes), "pinned_route": c.config.PinnedRoute})
+			return
+		}
+		index := -1
+		for i, route := range routes {
+			if route.ID == v.ID {
+				index = i
+			}
+		}
+		if index < 0 && !(r.URL.Path == "/admin/api/routes/pin" && v.ID == "") {
+			closeRoutes(routes)
+			fail(errors.New("出口不存在，请重新加载路由列表"))
+			return
+		}
+		if r.URL.Path == "/admin/api/routes/test" {
+			defer closeRoutes(routes)
+			// No bearer, no auth file, no /responses call. An HTTP response only proves
+			// transport reachability; even HTTP 200 is not evidence of a usable state.
+			probeCtx, stop := context.WithTimeout(ctx, 12*time.Second)
+			defer stop()
+			req, _ := http.NewRequestWithContext(probeCtx, "GET", c.effective().Upstream+"/models", nil)
+			client := &http.Client{Transport: routes[index].Transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+			start := time.Now()
+			resp, err := client.Do(req)
+			if err != nil {
+				fail(errors.New("出口连接失败。请确认代理程序已启动、端口正确，或换一个可用节点。"))
+				return
+			}
+			resp.Body.Close()
+			reply(w, 200, map[string]any{"message": "已收到 HTTP 响应。测试未携带登录信息，401/403 不代表你的账号被拒绝；这不证明能采到 292。", "status": resp.StatusCode, "duration_ms": time.Since(start).Milliseconds()})
+			return
+		}
+		c.pause()
+		defer c.resume()
+		if c.engine != nil && c.engine.Restricted() {
+			closeRoutes(routes)
+			reply(w, 409, map[string]string{"error": "上游拦截尚未解除，不能切换出口。"})
+			return
+		}
+		next := c.config
+		next.PinnedRoute = v.ID
+		if err = c.persist(next); err != nil {
+			closeRoutes(routes)
+			fail(err)
+			return
+		}
+		c.stop()
+		c.config = next
+		c.start(routes)
+		reply(w, 200, map[string]string{"message": "路由已切换，旧 state 已清空。"})
+	case "/admin/api/recover":
+		c.pause()
+		defer c.resume()
+		if c.engine != nil && c.engine.Restricted() {
+			reply(w, 409, map[string]string{"error": "当前账号仍处于上游拒绝或限流状态，请先处理登录或等待。"})
+			return
+		}
+		c.setup()
+		if c.setupError != "" {
+			fail(errors.New(c.setupError))
+			return
+		}
+		routes, err := proxyroute.Load(ctx, c.config)
+		if err != nil {
+			c.routeError = err.Error()
+			fail(err)
+			return
+		}
+		c.stop()
+		c.start(routes)
+		reply(w, 200, map[string]string{"message": "配置检查完成。接管配置后请重启 Codex。"})
+	default:
+		reply(w, 404, map[string]string{"error": "没有这个管理接口"})
+	}
+}

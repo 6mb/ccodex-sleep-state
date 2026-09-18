@@ -50,6 +50,7 @@ func TestServiceLifecycleInIsolatedHomes(t *testing.T) {
 	c := settings.Default()
 	c.Listen = freeAddress(t)
 	c.CodexHome = home
+	c.UpstreamMode = "manual"
 	c.Upstream = upstream.URL + "/backend-api/codex"
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

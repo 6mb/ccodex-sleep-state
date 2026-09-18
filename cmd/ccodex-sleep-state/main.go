@@ -28,6 +28,9 @@ const help = `ccodex-sleep-state — 一个本地服务，只处理 Astra
   ccodex-sleep-state init     创建本程序配置，暂不修改 Codex。
   ccodex-sleep-state serve    启动服务，备份并接管 Codex 配置；Ctrl+C 恢复。
   ccodex-sleep-state status   从正在运行的服务读取状态。
+
+  管理面板                   serve 启动后打开终端显示的 /admin/ 地址。
+                             在网页配置订阅、代理、路由和注入开关。
   ccodex-sleep-state check    检查配置和订阅，不发送模型请求。
   ccodex-sleep-state restore  崩溃后恢复 Codex 配置，不覆盖用户的新修改。
   ccodex-sleep-state paths    显示本机的配置与日志目录。
@@ -137,7 +140,7 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 			return err
 		}
 		if args[0] == "serve" {
-			return service.Run(ctx, *dir, c, !*noConfig, out)
+			return service.RunWithConfig(ctx, *dir, *configPath, c, !*noConfig, out)
 		}
 		routes, err := proxyroute.Load(ctx, c)
 		if err != nil {

@@ -4,7 +4,6 @@ package service
 import (
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,7 +17,6 @@ import (
 
 	"github.com/gylive/ccodex-sleep-state/internal/codexconfig"
 	"github.com/gylive/ccodex-sleep-state/internal/fsutil"
-	"github.com/gylive/ccodex-sleep-state/internal/gateway"
 	"github.com/gylive/ccodex-sleep-state/internal/instance"
 	"github.com/gylive/ccodex-sleep-state/internal/logbook"
 	"github.com/gylive/ccodex-sleep-state/internal/proxyroute"
@@ -31,7 +29,10 @@ type Runtime struct {
 	Token   string `json:"control_token"`
 }
 
-func Run(parent context.Context, dir string, c settings.Config, configure bool, out io.Writer) (result error) {
+func Run(parent context.Context, dir string, c settings.Config, configure bool, out io.Writer) error {
+	return RunWithConfig(parent, dir, filepath.Join(dir, "config.json"), c, configure, out)
+}
+func RunWithConfig(parent context.Context, dir, configPath string, c settings.Config, configure bool, out io.Writer) (result error) {
 	if err := c.Validate(); err != nil {
 		return err
 	}
@@ -54,27 +55,25 @@ func Run(parent context.Context, dir string, c settings.Config, configure bool, 
 	proxyroute.QuietCore()
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
-	routes, err := proxyroute.Load(ctx, c)
-	if err != nil {
-		return err
+	ctl := &control{ctx: ctx, config: c, path: configPath, dir: dir, configure: configure, log: logger}
+	ctl.setup()
+	routes, loadErr := proxyroute.Load(ctx, c)
+	if loadErr != nil {
+		ctl.routeError = loadErr.Error()
+	} else {
+		ctl.start(routes)
 	}
-	engine := gateway.New(c, routes, logger)
-	defer engine.Close()
-	if configure {
-		home, err := c.CodexDir()
-		if err != nil {
-			return err
-		}
-		if err = codexconfig.Install(dir, home, "http://"+c.Listen+"/backend-api/codex"); err != nil {
-			return err
-		}
-		defer func() {
+	defer func() {
+		ctl.mu.Lock()
+		defer ctl.mu.Unlock()
+		ctl.stop()
+		if configure {
 			if err := codexconfig.Restore(dir); err != nil {
 				logger.Error("config_restore_conflict")
 				result = errors.Join(result, err)
 			}
-		}()
-	}
+		}
+	}()
 	secret := make([]byte, 32)
 	if _, err = rand.Read(secret); err != nil {
 		return err
@@ -86,34 +85,13 @@ func Run(parent context.Context, dir string, c settings.Config, configure bool, 
 		return err
 	}
 	defer os.Remove(runtimePath)
-	mux := http.NewServeMux()
-	mux.HandleFunc("/_sleep/status", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.WriteHeader(405)
-			return
-		}
-		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+runtime.Token)) != 1 {
-			w.WriteHeader(401)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "no-store")
-		_ = json.NewEncoder(w).Encode(engine.Status())
-	})
-	mux.Handle("/", engine)
-	handler := gateway.ProtectLocal(c.Listen, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCtx, requestCancel := context.WithTimeout(r.Context(), 30*time.Minute)
-		defer requestCancel()
-		mux.ServeHTTP(w, r.WithContext(requestCtx))
-	}))
+	handler := controlHandler(c.Listen, runtime.Token, ctl)
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 64 << 10,
 		BaseContext: func(net.Listener) context.Context { return ctx }}
-	workerDone := make(chan struct{})
-	go func() { defer close(workerDone); engine.Run(ctx) }()
 	stopped := make(chan error, 1)
 	go func() { stopped <- server.Serve(listener) }()
 	logger.Info("service_started", "routes", len(routes), "model", settings.Model, "configured_codex", configure)
-	fmt.Fprintf(out, "Listening on http://%s\nAstra only. Restart Codex to load the local provider. Ctrl+C stops and restores configuration.\n", c.Listen)
+	fmt.Fprintf(out, "本地服务：http://%s\n管理面板：http://%s/admin/\n管理口令：%s\n口令只用于本机管理，请不要发到群里。Ctrl+C 停止并恢复已接管的配置。\n", c.Listen, c.Listen, runtime.Token)
 	select {
 	case err = <-stopped:
 		if !errors.Is(err, http.ErrServerClosed) {
@@ -127,7 +105,6 @@ func Run(parent context.Context, dir string, c settings.Config, configure bool, 
 	if err = server.Shutdown(shutdownCtx); err != nil {
 		_ = server.Close()
 	}
-	<-workerDone
 	logger.Info("service_stopped")
 	return result
 }
