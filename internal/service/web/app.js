@@ -1,9 +1,13 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
+const launchTicket = new URLSearchParams(location.hash.slice(1)).get("launch");
+if (location.hash) history.replaceState(null, "", location.pathname);
 let token = sessionStorage.getItem("sleep-state-control") || "";
 let state = null;
 let busy = false;
 let noticeTimer;
+let recovery = null;
+let preferencesDirty = false;
 function notice(text) {
   $("notice").textContent = text;
   $("notice").hidden = false;
@@ -44,6 +48,24 @@ async function action(fn) {
       button.disabled = false;
     });
     if (state && state.upstream_kind === "relay") $("toggle").disabled = true;
+    document
+      .querySelectorAll("[data-retry]")
+      .forEach(
+        (button) => (button.disabled = button.dataset.locked === "true"),
+      );
+    if (recovery) {
+      $("keep-current").disabled = !recovery.can_keep_current;
+      $("restore-backup").disabled = !recovery.can_restore_backup;
+    }
+    if (state && !state.configuration_writable)
+      for (const id of [
+        "recover",
+        "inspect-recovery",
+        "keep-current",
+        "restore-backup",
+        "quick-setup",
+      ])
+        $(id).disabled = true;
   }
 }
 const phases = {
@@ -62,20 +84,56 @@ function textNode(tag, text, className) {
 }
 async function refresh() {
   state = await api("status");
+  $("rescue-card").hidden = !state.rescue_mode;
   $("headline").textContent =
     state.config_error || state.route_error
       ? "有一项配置需要处理。"
-      : state.injection_enabled
-        ? "服务在运行，注入已开启。"
-        : "服务在运行，当前不注入。";
+      : !state.configured_codex
+        ? "服务已启动，等待 Codex 接入。"
+        : state.injection_enabled
+          ? "已接入 Codex，等待或正在处理请求。"
+          : "服务在运行，当前不注入。";
   $("mode").textContent =
     state.upstream_kind === "relay" ? "中转 / API 转发" : "官方 ChatGPT";
   $("route-count").textContent = state.routes;
   $("managed").textContent = state.configured_codex ? "已接管" : "未接管";
   $("toggle").textContent = state.injection_enabled ? "关闭注入" : "开启注入";
   $("toggle").disabled = state.upstream_kind === "relay";
-  if (state.injection_reason)
-    $("injection-help").textContent = state.injection_reason;
+  $("injection-help").textContent =
+    state.injection_reason ||
+    (state.injection_enabled
+      ? "注入已开启，是否已有可用 state 请看会话状态。"
+      : "注入已关闭，不采集或替换 state。");
+  for (const id of ["recover", "inspect-recovery"])
+    $(id).disabled = !state.configuration_writable;
+  if (!preferencesDirty && document.activeElement?.id !== "model-select")
+    $("model-select").value = state.model;
+  if (!preferencesDirty && document.activeElement?.id !== "account-select")
+    $("account-select").value = state.account_mode || "auto";
+  if (!preferencesDirty && document.activeElement?.id !== "fallback-select")
+    $("fallback-select").value = state.state_fallback || "strict";
+  const traffic = state.traffic || { total: 0, failed: 0, recent: [] };
+  $("step-config").textContent = state.configured_codex
+    ? "已接入 · 可检查或修复"
+    : "未接入 · 点这里处理";
+  $("step-route").textContent = state.routes
+    ? `${state.routes} 个出口配置 · 可更换`
+    : "没有可用出口 · 点这里配置";
+  $("step-request").textContent = traffic.total
+    ? `已收到 ${traffic.total} 次请求`
+    : "重启 Codex，再试一次";
+  $("traffic-summary").textContent =
+    `本次启动收到 ${traffic.total} 次请求，${traffic.failed} 次返回错误。切换出口不会清空这份记录。`;
+  $("recent-requests").replaceChildren();
+  for (const item of (traffic.recent || []).slice(-5).reverse()) {
+    $("recent-requests").append(
+      textNode(
+        "div",
+        `${new Date(item.at).toLocaleTimeString()} · ${item.kind} · HTTP ${item.status} · ${item.duration_ms} ms`,
+        "hint",
+      ),
+    );
+  }
   $("warnings").replaceChildren();
   for (const message of [state.config_error, state.route_error])
     if (message) $("warnings").append(textNode("div", message, "warning"));
@@ -84,7 +142,11 @@ async function refresh() {
     $("sessions").append(
       textNode(
         "p",
-        "还没收到 Codex 请求。接管配置后重启 Codex，再发一条短消息。",
+        traffic.total
+          ? "已经有请求到达，但还没有保留中的模型会话。请看上面的状态码；模型列表请求、被拦截请求或过期会话不代表已成功生成。"
+          : state.configured_codex
+            ? "还没收到请求。请重启 Codex，并新建会话发一条短消息；若仍为空，检查是否启动了另一份 Codex 配置。"
+            : "还没有请求到达本服务。先到「连接设置」完成配置接管，再重启 Codex。仅能打开面板不代表接入完成。",
         "hint",
       ),
     );
@@ -93,7 +155,65 @@ async function refresh() {
       "会话 " + (i + 1) + " · " + (phases[session.phase] || session.phase);
     if (session.retry_after_seconds)
       description += " · 还需等待约 " + session.retry_after_seconds + " 秒";
-    $("sessions").append(textNode("div", description, "session"));
+    description += session.model ? " · " + session.model : "";
+    description += session.expected_length
+      ? " · 目标 " + session.expected_length
+      : "";
+    const row = textNode("div", "", "session");
+    const detail = textNode("div", description);
+    for (const note of [session.account_note, session.diagnostic_message])
+      if (note)
+        detail.append(
+          textNode(
+            "p",
+            typeof note === "string" ? note : JSON.stringify(note),
+            "hint",
+          ),
+        );
+    row.append(detail);
+    if (session.observed_length)
+      detail.append(
+        textNode(
+          "p",
+          `最近收到 ${session.observed_length} 字符；当前目标 ${session.expected_length}。`,
+          "hint",
+        ),
+      );
+    if (session.id && state.injection_enabled) {
+      const retry = textNode(
+        "button",
+        session.cooldown_seconds > 0
+          ? `等待 ${session.cooldown_seconds} 秒后再采集`
+          : "重新采集",
+        "secondary",
+      );
+      retry.dataset.retry = session.id;
+      retry.dataset.locked = String(
+        session.cooldown_seconds > 0 ||
+          ["ready", "collecting", "auth_blocked", "rate_limited"].includes(
+            session.phase,
+          ),
+      );
+      retry.disabled = retry.dataset.locked === "true";
+      retry.addEventListener("click", () =>
+        action(async () => {
+          if (
+            !confirm(
+              `重新采集会使用这个会话的账号和模型，本轮最多 ${state.max_probes_per_round || 6} 次短请求，会消耗额度。冷却和登录/限流暂停不会被跳过。继续？`,
+            )
+          )
+            return;
+          try {
+            const result = await api("state/retry", { id: session.id });
+            notice(result.message);
+          } finally {
+            await refresh();
+          }
+        }),
+      );
+      row.append(retry);
+    }
+    $("sessions").append(row);
   }
 }
 async function enter() {
@@ -256,8 +376,138 @@ $("auto-route").addEventListener("click", () =>
     await refresh();
   }),
 );
-if (token) action(enter);
+if (launchTicket)
+  action(async () => {
+    const value = await api("launch", { ticket: launchTicket });
+    token = value.control_token;
+    await enter();
+  });
+else if (token) action(enter);
 setInterval(() => {
   if (token && !busy && !document.hidden)
     refresh().catch((error) => notice(error.message));
 }, 10000);
+
+$("preferences-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  action(async () => {
+    const result = await api("preferences", {
+      model: $("model-select").value,
+      account_mode: $("account-select").value,
+      state_fallback: $("fallback-select").value,
+    });
+    preferencesDirty = false;
+    notice(result.message);
+    await refresh();
+  });
+});
+$("inspect-recovery").addEventListener("click", () =>
+  action(async () => {
+    recovery = await api("recovery/preview", {});
+    $("recovery-panel").hidden = false;
+    $("recovery-summary").textContent = recovery.message;
+    $("keep-current").disabled = !recovery.can_keep_current;
+    $("restore-backup").disabled = !recovery.can_restore_backup;
+  }),
+);
+async function repair(mode) {
+  if (!recovery) return;
+  const question =
+    mode === "restore_backup"
+      ? "恢复接管前的备份？这会撤销之后对 Codex 配置的修改。当前文件会独立备份。"
+      : "保留 CCS 当前选择，移除能确认属于旧版本的配置，再重新接管？当前文件会先备份。";
+  if (!confirm(question)) return;
+  const result = await api("recovery/apply", {
+    mode,
+    expected_config_sha256: recovery.config_sha256,
+    expected_transaction_sha256: recovery.transaction_sha256,
+  });
+  recovery = null;
+  $("recovery-panel").hidden = true;
+  notice(result.message);
+  await refresh();
+}
+$("keep-current").addEventListener("click", () =>
+  action(() => repair("keep_current")),
+);
+$("restore-backup").addEventListener("click", () =>
+  action(() => repair("restore_backup")),
+);
+$("download-diagnostics").addEventListener("click", () =>
+  action(async () => {
+    const value = await api("diagnostics", {});
+    const url = URL.createObjectURL(
+      new Blob([JSON.stringify(value, null, 2)], { type: "application/json" }),
+    );
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "sleep-state-diagnostics.json";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }),
+);
+
+$("reset-service-config").addEventListener("click", () =>
+  action(async () => {
+    const preview = await api("service-config/preview", {});
+    if (!confirm(preview.message)) return;
+    const result = await api("service-config/reset", {
+      expected_config_sha256: preview.config_sha256,
+    });
+    notice(result.message);
+  }),
+);
+
+$("rebuild-kind").addEventListener("change", () => {
+  $("rebuild-relay").hidden = $("rebuild-kind").value !== "relay";
+});
+$("rebuild-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  action(async () => {
+    const preview = await api("codex-config/preview", {});
+    if (
+      !confirm(
+        "将完整备份旧 Codex 配置，再按所选账号重建最小配置。原有插件、MCP 和其他设置只保留在备份中，不会自动迁移。确认继续？",
+      )
+    )
+      return;
+    const value = await api("codex-config/rebuild", {
+      kind: $("rebuild-kind").value,
+      upstream: $("rebuild-url").value.trim(),
+      env_key: $("rebuild-env").value.trim(),
+      expected_config_sha256: preview.config_sha256,
+      expected_exists: preview.exists,
+    });
+    $("rebuild-url").value = "";
+    notice(value.message);
+    await refresh();
+  });
+});
+
+document.querySelectorAll("[data-jump]").forEach((button) =>
+  button.addEventListener("click", () => {
+    document.querySelector(`[data-page="${button.dataset.jump}"]`).click();
+  }),
+);
+
+$("quick-setup").addEventListener("click", () =>
+  action(async () => {
+    if (
+      !confirm(
+        "自动备份并接入当前 Codex，检查常见本地代理；已有订阅和账号不重置。采不到合格 state 时先普通转发。开启注入后的模型请求可能触发有限采集并消耗额度。继续？",
+      )
+    )
+      return;
+    try {
+      const value = await api("quick-setup", {});
+      notice(value.message);
+    } finally {
+      await refresh();
+    }
+  }),
+);
+
+for (const id of ["model-select", "account-select", "fallback-select"])
+  $(id).addEventListener("change", () => {
+    preferencesDirty = true;
+  });

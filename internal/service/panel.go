@@ -16,7 +16,7 @@ var panelFiles embed.FS
 
 // The browser gets only static assets without a token. All data and actions use
 // a bearer token kept in sessionStorage, never cookies or a URL query string.
-func controlHandler(host, token string, c *control) http.Handler {
+func controlHandler(host, token string, c *control, tickets ...*browserTicket) http.Handler {
 	gatewayHandler := gateway.ProtectLocal(host, c)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
@@ -41,9 +41,26 @@ func controlHandler(host, token string, c *control) http.Handler {
 				http.Error(w, "拒绝跨站请求", 403)
 				return
 			}
+			if r.URL.Path == "/admin/api/launch" && len(tickets) > 0 && tickets[0] != nil {
+				tickets[0].exchange(w, r, token)
+				return
+			}
 			if strings.HasPrefix(r.URL.Path, "/admin/api/") || r.URL.Path == "/_sleep/status" {
 				if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+token)) != 1 {
 					reply(w, 401, map[string]string{"error": "管理口令不正确或服务已重启，请从终端复制新口令。"})
+					return
+				}
+				if r.URL.Path == "/admin/api/new-launch" && len(tickets) > 0 && tickets[0] != nil {
+					if r.Method != "POST" {
+						w.WriteHeader(405)
+						return
+					}
+					value, err := tickets[0].renew()
+					if err != nil {
+						reply(w, 500, map[string]string{"error": "无法生成启动凭证"})
+						return
+					}
+					reply(w, 200, map[string]string{"ticket": value})
 					return
 				}
 				if r.URL.Path == "/_sleep/status" {

@@ -13,6 +13,8 @@ import (
 type Options struct {
 	Profile  string
 	AuthMode string
+	// Model chooses the managed model. Empty keeps the Astra default.
+	Model string
 	// ExpectedConfigSHA256 binds installation to the document resolved by the
 	// service. Empty retains the standalone Patch/Install API.
 	ExpectedConfigSHA256 string

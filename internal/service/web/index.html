@@ -37,7 +37,8 @@
     </section>
     <div id="workspace" hidden>
       <nav aria-label="管理页面">
-        <button data-page="overview" class="active">运行状态</button
+        <button data-page="overview" class="active">开始使用</button
+        ><button data-page="configuration">连接设置</button
         ><button data-page="sources">订阅与代理</button
         ><button data-page="routes">路由</button
         ><button data-page="help">遇到问题</button>
@@ -46,8 +47,51 @@
         <section data-view="overview">
           <p class="eyebrow">运行状态</p>
           <h1 id="headline">正在读取状态…</h1>
-          <p class="lead">能连上、能回复、能采到合格 state，是三件不同的事。</p>
+          <p class="lead">
+            先让 Codex 接上，再决定要不要注入。配置和故障都留在这个窗口处理。
+          </p>
+          <div class="quick-start">
+            <div>
+              <strong>不想研究设置？从这里开始。</strong>
+              <p>
+                沿用当前账号，自动备份配置，检查常见本地代理。采不到 state
+                时先正常转发。
+              </p>
+            </div>
+            <button id="quick-setup">一键接入 Codex</button>
+          </div>
+          <div class="onboarding" aria-label="接入进度">
+            <button class="step" data-jump="configuration">
+              <span class="step-number">1</span
+              ><span
+                ><strong>接入 Codex</strong
+                ><small id="step-config">检查当前配置</small></span
+              >
+            </button>
+            <button class="step" data-jump="sources">
+              <span class="step-number">2</span
+              ><span
+                ><strong>选择连接</strong
+                ><small id="step-route">直连、代理或订阅</small></span
+              >
+            </button>
+            <button class="step" data-jump="overview">
+              <span class="step-number">3</span
+              ><span
+                ><strong>发条消息</strong
+                ><small id="step-request">重启 Codex，再试一次</small></span
+              >
+            </button>
+          </div>
           <div id="warnings"></div>
+          <section id="rescue-card" class="card" hidden>
+            <h2>服务配置损坏，但不用手改 JSON</h2>
+            <p>
+              现在运行的是只读修复面板。旧配置没有被加载，也没有接管
+              Codex。点击后先看说明，再确认是否备份并重建。
+            </p>
+            <button id="reset-service-config">检查并重建服务配置</button>
+          </section>
           <div class="stats">
             <div><span>当前模式</span><strong id="mode">—</strong></div>
             <div><span>可用出口</span><strong id="route-count">—</strong></div>
@@ -70,8 +114,59 @@
             </p>
           </section>
           <section class="card">
-            <h2>会话状态</h2>
+            <h2>请求与会话</h2>
+            <p id="traffic-summary" class="hint"></p>
+            <div id="recent-requests" class="stack"></div>
             <div id="sessions" class="stack"></div>
+          </section>
+        </section>
+        <section data-view="configuration" hidden>
+          <p class="eyebrow">连接设置</p>
+          <h1>只管你这一次要用的连接。</h1>
+          <p class="lead">
+            普通设置直接保存。出现旧版本或 CCS
+            冲突时，先检查再修复；不用手动删文件。
+          </p>
+          <section class="card">
+            <h2>模型与账号规则</h2>
+            <form id="preferences-form">
+              <div class="settings-grid">
+                <div>
+                  <label for="model-select">默认模型</label
+                  ><select id="model-select">
+                    <option value="gpt-6-astra">Astra</option>
+                    <option value="gpt-5.6-sol">5.6 Sol</option>
+                    <option value="gpt-5.6-terra">5.6 Terra</option>
+                  </select>
+                </div>
+                <div>
+                  <label for="account-select">账号规则</label
+                  ><select id="account-select">
+                    <option value="auto">自动识别（不确定时提示）</option>
+                    <option value="personal">个人 · 292 / 10 块</option>
+                    <option value="team">Team · 332 / 12 块</option>
+                  </select>
+                </div>
+              </div>
+              <p class="hint">
+                Team 不再按个人账号的 292 筛选。312、356
+                不会冒充合格结果。长度只是实验规则，不是模型智力检测；可用模型仍以你的上游权限为准。
+              </p>
+              <label for="fallback-select">暂时采不到合格 state 时</label
+              ><select id="fallback-select">
+                <option value="strict">
+                  严格等待 · 不转发正式请求，返回本地 503
+                </option>
+                <option value="passthrough">
+                  先正常使用 · 不注入，原请求只转发一次
+                </option>
+              </select>
+              <p class="hint">
+                “先正常使用”不是采集成功，也不保证改善降智。401、403、429
+                仍暂停；已经发给上游的请求不会自动重发。
+              </p>
+              <button type="submit" class="secondary">保存模型与规则</button>
+            </form>
           </section>
           <section class="card">
             <h2>CCS / CC Switch 与中转站</h2>
@@ -81,14 +176,69 @@
               key；不会把官方登录凭据拿去试中转站。
             </p>
             <p>
-              服务运行时别同时在 CCS
-              里切换同一份配置。检测到改动会停止接管流程，不强行覆盖你的新配置。先停服务，再切换，再启动。
+              注释和无关设置的改动不再导致整份配置报错。若 CCS
+              切换了上游或认证，服务会暂停转发，避免把凭据发错地方。点下面的检查按钮，保留当前选择后重新接管即可。
             </p>
-            <button id="recover" class="secondary">重新检查并接管配置</button>
+            <div class="actions">
+              <button id="recover" class="secondary">重新检查并接管</button
+              ><button id="inspect-recovery" class="secondary">
+                检查与修复配置
+              </button>
+            </div>
+            <div id="recovery-panel" hidden>
+              <p id="recovery-summary" class="result"></p>
+              <div class="actions">
+                <button id="keep-current">保留当前配置并重新接管</button
+                ><button id="restore-backup" class="secondary">
+                  恢复接管前备份
+                </button>
+              </div>
+              <p class="hint">
+                两种操作都会先备份当前配置和恢复记录。恢复旧备份会撤销之后的修改；不确定就选保留当前配置。
+              </p>
+            </div>
             <p class="hint">
-              使用 --no-config 启动时，此按钮不会修改 Codex 配置。
+              只读模式（--no-config）不会写入配置，需要退出后用 setup
+              启动。切换完成后重启 Codex，让新会话使用新配置。
             </p>
           </section>
+          <details class="card">
+            <summary>配置已经很乱，重新配置连接</summary>
+            <p class="hint">
+              最后手段，不是常规操作。会完整备份旧
+              config.toml，再生成最小连接配置。原插件、MCP
+              和个性化设置不会搬进新文件；可以从备份恢复。已有旧接管记录时，先用上面的配置修复。
+            </p>
+            <form id="rebuild-form">
+              <label for="rebuild-kind">这次明确要用哪种账号？</label
+              ><select id="rebuild-kind">
+                <option value="official">官方 ChatGPT 登录</option>
+                <option value="relay">API key / 中转站</option>
+              </select>
+              <div id="rebuild-relay" hidden>
+                <label for="rebuild-url">Responses API 基础地址</label
+                ><input
+                  id="rebuild-url"
+                  type="password"
+                  autocomplete="off"
+                  placeholder="https://你的中转站/v1"
+                /><label for="rebuild-env"
+                  >已有 API key 的环境变量名（可选）</label
+                ><input
+                  id="rebuild-env"
+                  autocomplete="off"
+                  placeholder="OPENAI_API_KEY（变量名，不是密钥）"
+                />
+                <p class="hint">
+                  留空时只使用 Codex / CCS 已配置的 API
+                  key。这里不会读取或上传你的密钥。
+                </p>
+              </div>
+              <button type="submit" class="secondary">
+                备份并重建连接配置
+              </button>
+            </form>
+          </details>
         </section>
         <section data-view="sources" hidden>
           <p class="eyebrow">订阅与代理</p>
@@ -167,6 +317,16 @@
         <section data-view="help" hidden>
           <p class="eyebrow">遇到问题</p>
           <h1>先看是哪一层没通。</h1>
+          <div class="card">
+            <h2>发给群友或 AI 的排查结果</h2>
+            <p>
+              只导出请求次数、状态码和配置状态，不导出密钥、订阅、对话、配置路径或
+              state。
+            </p>
+            <button id="download-diagnostics" class="secondary">
+              下载脱敏诊断
+            </button>
+          </div>
           <div class="card prose">
             <h2>本地 503：还没有合格 state</h2>
             <p>
@@ -205,6 +365,8 @@
       </main>
     </div>
     <div id="notice" role="status" aria-live="polite" hidden></div>
-    <footer>只做 Astra。尝试改善使用体验，不保证消除降智或限流。</footer>
+    <footer>
+      Astra · Sol · Terra。尝试改善使用体验，不保证消除降智或限流。
+    </footer>
   </body>
 </html>

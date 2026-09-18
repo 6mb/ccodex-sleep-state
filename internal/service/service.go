@@ -32,7 +32,13 @@ type Runtime struct {
 func Run(parent context.Context, dir string, c settings.Config, configure bool, out io.Writer) error {
 	return RunWithConfig(parent, dir, filepath.Join(dir, "config.json"), c, configure, out)
 }
-func RunWithConfig(parent context.Context, dir, configPath string, c settings.Config, configure bool, out io.Writer) (result error) {
+func RunWithConfig(parent context.Context, dir, configPath string, c settings.Config, configure bool, out io.Writer) error {
+	return run(parent, dir, configPath, c, configure, false, false, out)
+}
+func RunSetup(parent context.Context, dir, configPath string, c settings.Config, configure bool, out io.Writer) error {
+	return run(parent, dir, configPath, c, configure, false, true, out)
+}
+func run(parent context.Context, dir, configPath string, c settings.Config, configure, rescue, launchBrowser bool, out io.Writer) (result error) {
 	if err := c.Validate(); err != nil {
 		return err
 	}
@@ -55,13 +61,22 @@ func RunWithConfig(parent context.Context, dir, configPath string, c settings.Co
 	proxyroute.QuietCore()
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
-	ctl := &control{ctx: ctx, config: c, path: configPath, dir: dir, configure: configure, log: logger}
-	ctl.setup()
-	routes, loadErr := proxyroute.Load(ctx, c)
-	if loadErr != nil {
-		ctl.routeError = loadErr.Error()
+	ctl := &control{ctx: ctx, config: c, path: configPath, dir: dir, configure: configure, rescue: rescue, log: logger}
+
+	var routes []proxyroute.Route
+	if launchBrowser && configure && !rescue {
+		if err := ctl.quickSetupMode(ctx, false); err != nil {
+			ctl.setupError = "自动接入未完成：" + err.Error() + "。请在面板检查与修复，原配置和备份不会被强制覆盖。"
+		}
 	} else {
-		ctl.start(routes)
+		ctl.setup()
+		var loadErr error
+		routes, loadErr = proxyroute.Load(ctx, c)
+		if loadErr != nil {
+			ctl.routeError = loadErr.Error()
+		} else {
+			ctl.start(routes)
+		}
 	}
 	defer func() {
 		ctl.mu.Lock()
@@ -85,12 +100,23 @@ func RunWithConfig(parent context.Context, dir, configPath string, c settings.Co
 		return err
 	}
 	defer os.Remove(runtimePath)
-	handler := controlHandler(c.Listen, runtime.Token, ctl)
+	ticket, err := newBrowserTicket()
+	if err != nil {
+		return err
+	}
+	launchURL := "http://" + c.Listen + "/admin/#launch=" + ticket.value
+	handler := controlHandler(c.Listen, runtime.Token, ctl, ticket)
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 64 << 10,
 		BaseContext: func(net.Listener) context.Context { return ctx }}
 	stopped := make(chan error, 1)
 	go func() { stopped <- server.Serve(listener) }()
-	logger.Info("service_started", "routes", len(routes), "model", settings.Model, "configured_codex", configure)
+	if launchBrowser {
+		if err := openPanel(launchURL); err != nil {
+			fmt.Fprintln(out, "未能自动打开浏览器，请手动打开管理面板并粘贴下方口令。")
+		}
+	}
+	startupStatus := ctl.status()
+	logger.Info("service_started", "routes", startupStatus["routes"], "model", c.SelectedModel(), "configured_codex", startupStatus["configured_codex"])
 	fmt.Fprintf(out, "本地服务：http://%s\n管理面板：http://%s/admin/\n管理口令：%s\n口令只用于本机管理，请不要发到群里。Ctrl+C 停止并恢复已接管的配置。\n", c.Listen, c.Listen, runtime.Token)
 	select {
 	case err = <-stopped:

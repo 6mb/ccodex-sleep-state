@@ -38,12 +38,22 @@ func PatchWithOptions(original []byte, baseURL string, options Options) ([]byte,
 	if toml.Unmarshal(original, &document) != nil {
 		return nil, errors.New("Codex config is not valid TOML; left unchanged")
 	}
+	if referencesManaged(document) {
+		return nil, errors.New("configuration already references the managed provider; recover its previous transaction first")
+	}
 	if providers, ok := document["model_providers"].(map[string]any); ok {
 		if _, exists := providers[provider]; exists {
 			return nil, errors.New("provider name already exists; restore the previous service transaction first")
 		}
 	}
-	replacements := map[string]string{"model": strconv.Quote(settings.Model), "model_provider": strconv.Quote(provider), "openai_base_url": strconv.Quote(baseURL)}
+	model := options.Model
+	if model == "" {
+		model = settings.Model
+	}
+	if model != "gpt-6-astra" && model != "gpt-5.6-sol" && model != "gpt-5.6-terra" {
+		return nil, errors.New("unsupported managed model")
+	}
+	replacements := map[string]string{"model": strconv.Quote(model), "model_provider": strconv.Quote(provider), "openai_base_url": strconv.Quote(baseURL)}
 	var edits []edit
 	var parser unstable.Parser
 	parser.Reset(original)
@@ -148,7 +158,15 @@ func PatchWithOptions(original []byte, baseURL string, options Options) ([]byte,
 			managed[key] = value
 		}
 	}
+	// Codex uses this name to discover official remote-compaction support.
+	// An arbitrary local label silently disables that capability.
 	managed["name"] = "Sleep State (local)"
+	if name, ok := selection.fields["name"].(string); ok && name != "" {
+		managed["name"] = name
+	}
+	if selection.Official {
+		managed["name"] = "OpenAI"
+	}
 	managed["base_url"] = baseURL
 	managed["wire_api"] = "responses"
 	managed["supports_websockets"] = false

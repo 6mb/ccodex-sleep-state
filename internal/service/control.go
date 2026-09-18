@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -30,11 +31,13 @@ type control struct {
 	config                 settings.Config
 	path, dir              string
 	configure, managed     bool
+	rescue                 bool
 	setupError, routeError string
 	engine                 *gateway.Engine
 	cancel                 context.CancelFunc
 	done                   chan struct{}
 	log                    *slog.Logger
+	history                requestHistory
 }
 
 func (c *control) start(routes []proxyroute.Route) {
@@ -142,7 +145,7 @@ func (c *control) installProvider() error {
 	if err = next.Validate(); err != nil {
 		return err
 	}
-	options := codexconfig.Options{Profile: c.config.CodexProfile, AuthMode: authMode, ExpectedConfigSHA256: selected.ConfigSHA256}
+	options := codexconfig.Options{Profile: c.config.CodexProfile, AuthMode: authMode, Model: c.config.SelectedModel(), ExpectedConfigSHA256: selected.ConfigSHA256}
 	if err = codexconfig.InstallWithOptions(c.dir, home, "http://"+c.config.Listen+"/backend-api/codex", options); err != nil {
 		return err
 	}
@@ -164,16 +167,44 @@ func (c *control) checkManaged() error {
 	return nil
 }
 func (c *control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	observed := &observedResponse{ResponseWriter: w}
+	started := time.Now()
+	defer func() {
+		status := observed.status
+		if status == 0 {
+			status = 200
+		}
+		c.history.record(requestEvent{Kind: requestKind(r.URL.Path), Status: status, DurationMS: time.Since(started).Milliseconds(), At: time.Now().UTC()})
+	}()
+	w = observed
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.managed {
 		if err := c.checkManaged(); err != nil {
-			reply(w, 409, map[string]string{"error": "codex_config_changed", "message": "Codex 配置已被 CCS 或其他程序修改。请停止服务，确认所选配置后重新启动；不会覆盖你的改动。"})
+			reply(w, 409, map[string]string{"error": "codex_config_changed", "message": "Codex 配置已被 CCS 或其他程序修改。请打开管理面板，点击「检查与修复配置」；确认当前选择后重新接管并重启 Codex。不会覆盖你的改动。"})
 			return
 		}
 	}
-	if c.engine == nil || c.setupError != "" {
-		reply(w, 503, map[string]string{"error": "service_not_ready", "message": "请打开本地管理面板，处理出口配置或 Codex 配置恢复问题。"})
+	if c.rescue || c.engine == nil || c.setupError != "" || c.routeError != "" {
+		// Codex only shows the JSON error body.  Keep the response actionable for
+		// people who do not know how to inspect a terminal: expose the local
+		// panel URL and the concrete setup/route reason, never credentials.
+		message := "服务还没有准备好。请打开管理面板，点击「一键接入 / 检查并修复」，不用手改配置文件。"
+		if c.rescue {
+			message = "服务配置文件需要修复。请打开管理面板，按提示备份并重建服务配置；不会覆盖 Codex 原文件。"
+		} else if c.setupError != "" {
+			message = "一键接入没有完成：" + c.setupError + " 请打开管理面板，点击「检查与修复配置」；原文件不会被强制覆盖。"
+		} else if c.routeError != "" {
+			message = "出口还没有准备好：" + c.routeError + " 请打开管理面板，在「订阅与代理」点「一键检查并接入」，无需手填 JSON。"
+		}
+		adminURL := "http://" + c.config.Listen + "/admin/"
+		message += " 管理面板：" + adminURL
+		reply(w, 503, map[string]string{
+			"error": "service_not_ready",
+			"message": message,
+			"admin_url": adminURL,
+			"next_action": "打开 admin_url，按页面唯一的绿色按钮继续；不要在 CCS 或 Codex 中手改配置。",
+		})
 		return
 	}
 	c.engine.ServeHTTP(w, r)
@@ -189,14 +220,39 @@ func (c *control) status() map[string]any {
 	result["upstream_kind"] = c.effective().UpstreamKind
 	result["configured_codex"], result["config_error"], result["route_error"] = c.managed, c.setupError, c.routeError
 	if err := c.checkManaged(); err != nil {
-		result["config_error"] = "Codex 配置或认证方式已被外部修改。请先停止服务，再确认 CCS 所选配置并重新启动。"
+		result["config_error"] = "Codex 的连接或认证配置已改变。请点击「检查与修复配置」，选择保留 CCS 当前配置，再重新接管。"
 		result["configured_codex"] = false
 	}
 	result["pinned_route"] = c.config.PinnedRoute
+	result["configuration_writable"] = c.configure
+	result["rescue_mode"] = c.rescue
+	result["model"] = c.config.SelectedModel()
+	result["supported_models"] = settings.SupportedModels()
+	result["account_mode"] = c.config.AccountMode
+	result["state_fallback"] = c.config.StateFallback
+	result["traffic"] = c.history.snapshot()
+	result["injection_effective"] = !c.effective().InjectionDisabled && c.engine != nil && result["configured_codex"] == true && result["config_error"] == "" && c.routeError == ""
+	if c.effective().IsRelay() {
+		result["injection_reason"] = "当前为 API / 中转转发，不采集或注入官方 state。"
+	} else if c.effective().InjectionDisabled {
+		result["injection_reason"] = "注入已关闭。经过本服务的请求按原样转发，不采集 state。"
+	} else if result["configured_codex"] != true {
+		result["injection_reason"] = "注入开关已开启，但 Codex 配置尚未接管。先完成接入，不能据此判断请求已经经过本服务。"
+	} else {
+		result["injection_reason"] = "注入开关已开启；收到请求后按账号和模型分别采集。是否已有可用 state，请看下方会话状态。"
+	}
 	result["sources"] = map[string]any{"direct": c.config.Direct, "proxies": len(c.config.ProxyURLs) + len(c.config.ProxyEnvs), "subscriptions": len(c.config.Subscriptions)}
 	return result
 }
 func (c *control) persist(next settings.Config) error {
+	if err := fsutil.RefuseLink(c.path); err != nil {
+		return err
+	}
+	original, readErr := os.ReadFile(c.path)
+	existed := readErr == nil
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return errors.New("无法读取原配置，未保存")
+	}
 	// Keep an independent backup and don't overwrite edits made outside the UI.
 	if data, err := os.ReadFile(c.path); err == nil {
 		previous, err := settings.Load(c.path)
@@ -213,6 +269,13 @@ func (c *control) persist(next settings.Config) error {
 		}
 	} else if !os.IsNotExist(err) {
 		return errors.New("无法读取原配置，未保存")
+	}
+	if err := fsutil.RefuseLink(c.path); err != nil {
+		return err
+	}
+	fresh, err := os.ReadFile(c.path)
+	if (err == nil) != existed || (err != nil && !os.IsNotExist(err)) || !bytes.Equal(fresh, original) {
+		return errors.New("保存期间配置被其他程序修改，已保留备份但未覆盖文件")
 	}
 	data, _ := json.MarshalIndent(next, "", "  ")
 	return fsutil.Write(c.path, append(data, '\n'))

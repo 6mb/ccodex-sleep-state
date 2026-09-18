@@ -27,6 +27,9 @@ type Source struct {
 }
 
 type Config struct {
+	StateFallback        string   `json:"state_fallback,omitempty"`
+	Model                string   `json:"model,omitempty"`
+	AccountMode          string   `json:"account_mode,omitempty"`
 	UpstreamMode         string   `json:"upstream_mode,omitempty"`
 	UpstreamKind         string   `json:"upstream_kind,omitempty"`
 	CodexProfile         string   `json:"codex_profile,omitempty"`
@@ -49,7 +52,7 @@ type Config struct {
 }
 
 func Default() Config {
-	return Config{UpstreamKind: "official", Listen: "127.0.0.1:17841", Upstream: "https://chatgpt.com/backend-api/codex", Direct: true,
+	return Config{Model: Model, AccountMode: "auto", UpstreamKind: "official", Listen: "127.0.0.1:17841", Upstream: "https://chatgpt.com/backend-api/codex", Direct: true,
 		ProxyURLs: []string{}, ProxyEnvs: []string{}, Subscriptions: []Source{}, ProbeSeconds: 20,
 		RefreshSeconds: 1200, CooldownSeconds: 180, MaxProbes: 6, TTLSeconds: 3600, BaselineBlocks: 10}
 }
@@ -74,6 +77,15 @@ func Load(path string) (Config, error) {
 }
 
 func (c Config) Validate() error {
+	if c.StateFallback != "" && c.StateFallback != "strict" && c.StateFallback != "passthrough" {
+		return errors.New("state_fallback must be strict or passthrough")
+	}
+	if !SupportedModel(c.SelectedModel()) {
+		return errors.New("model must be gpt-6-astra, gpt-5.6-sol or gpt-5.6-terra")
+	}
+	if c.AccountMode != "" && c.AccountMode != "auto" && c.AccountMode != "personal" && c.AccountMode != "team" {
+		return errors.New("account_mode must be auto, personal or team")
+	}
 	if c.UpstreamMode != "" && c.UpstreamMode != "auto" && c.UpstreamMode != "manual" {
 		return errors.New("upstream_mode must be auto or manual")
 	}
@@ -158,3 +170,19 @@ func (c Config) CodexDir() (string, error) {
 
 // IsRelay distinguishes user-selected API-key providers from the official login flow.
 func (c Config) IsRelay() bool { return c.UpstreamKind == "relay" }
+
+// SelectedModel preserves configs written before the model selector existed.
+func (c Config) SelectedModel() string {
+	if c.Model == "" {
+		return Model
+	}
+	return c.Model
+}
+func SupportedModel(model string) bool {
+	switch model {
+	case Model, "gpt-5.6-sol", "gpt-5.6-terra":
+		return true
+	}
+	return false
+}
+func SupportedModels() []string { return []string{Model, "gpt-5.6-sol", "gpt-5.6-terra"} }

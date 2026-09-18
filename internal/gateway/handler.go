@@ -27,12 +27,16 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusUpgradeRequired, "http_sse_required", "This provider uses HTTP/SSE, not WebSocket.")
 		return
 	}
+	compact := r.Method == http.MethodPost && r.URL.Path == "/backend-api/codex/responses/compact"
+	bridgeCompact := compact && !e.config.IsRelay()
 	generation := r.Method == http.MethodPost && (r.URL.Path == "/backend-api/codex/responses" || r.URL.Path == "/backend-api/codex/responses/compact")
 	passthrough := (r.Method == http.MethodGet && r.URL.Path == "/backend-api/codex/models") || (r.Method == http.MethodPost && r.URL.Path == "/backend-api/codex/alpha/search")
 	if !generation && !passthrough {
 		fail(w, http.StatusNotFound, "unsupported_endpoint", "Endpoint is not exposed by this service.")
 		return
 	}
+	e.requests.Add(1)
+	e.lastRequest.Store(time.Now().Unix())
 	if e.config.IsRelay() && officialCredential(r.Header.Get("Authorization")) {
 		fail(w, http.StatusUnauthorized, "official_credentials_on_relay", "检测到官方登录凭据，已阻止发送给中转站。请为当前中转配置独立 API key。")
 		return
@@ -41,24 +45,18 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fail(w, 503, "no_routes", "没有可用出口。请在管理面板添加本地代理、订阅或启用直连。")
 		return
 	}
-	s, err := e.borrow(r.Header)
-	if err != nil {
-		fail(w, http.StatusUnauthorized, "authentication_required", "Log in with Codex before using this service.")
-		return
-	}
-	defer release(s)
-	if rejectRequest(w, s) {
-		return
-	}
+	model := e.config.SelectedModel()
 	if r.Method == http.MethodPost {
-		if encoding := r.Header.Get("Content-Encoding"); encoding != "" && encoding != "identity" {
-			fail(w, 415, "unsupported_encoding", "Send uncompressed JSON.")
-			return
-		}
-		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
-		r.Body.Close()
+		body, status, err := requestBody(r)
 		if err != nil {
-			fail(w, http.StatusRequestEntityTooLarge, "request_too_large", "Request body exceeds the limit or could not be read.")
+			code := "invalid_request_encoding"
+			if status == http.StatusUnsupportedMediaType {
+				code = "unsupported_encoding"
+			}
+			if status == http.StatusRequestEntityTooLarge {
+				code = "request_too_large"
+			}
+			fail(w, status, code, err.Error())
 			return
 		}
 		if generation {
@@ -69,15 +67,41 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				fail(w, 400, "invalid_json", "Expected a JSON request.")
 				return
 			}
-			if input.Model != settings.Model {
-				fail(w, 400, "unsupported_model", "Only gpt-6-astra is supported.")
+			if !settings.SupportedModel(input.Model) {
+				fail(w, 400, "unsupported_model", "支持 gpt-6-astra、gpt-5.6-sol 和 gpt-5.6-terra；请在 Codex 中选择受支持的模型。")
+				return
+			}
+			model = input.Model
+			if !compact {
+				compact = remoteCompactionV2(body)
+			}
+		}
+		if bridgeCompact {
+			body, err = bridgeCompactRequest(body)
+			if err != nil {
+				fail(w, 400, "invalid_compaction_request", err.Error())
 				return
 			}
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		r.ContentLength = int64(len(body))
+		r.Header.Del("Content-Encoding")
+		r.Header.Del("Content-Length")
+		r.Header.Del("Transfer-Encoding")
+		r.TransferEncoding = nil
 	}
-	inject := generation && !e.disabled.Load()
+	s, err := e.borrow(r.Header, model)
+	if err != nil {
+		fail(w, http.StatusUnauthorized, "authentication_required", "Log in with Codex before using this service.")
+		return
+	}
+	defer release(s)
+	if rejectRequest(w, s) {
+		return
+	}
+	// Compaction has its own upstream protocol. Do not require a synthetic
+	// generation probe or apply response-state shape rules to its result.
+	inject := generation && !compact && !e.disabled.Load()
 	if inject {
 		s.mu.Lock()
 		s.activated = true
@@ -91,9 +115,16 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if rejectRequest(w, s) {
 		return
 	}
+	if inject && !usable && e.config.StateFallback == "passthrough" {
+		// The user's generation has not been sent yet. Forward it once without
+		// injection; never replay it after an upstream response or account limit.
+		inject = false
+		w.Header().Set("X-Sleep-State-Mode", "fallback-passthrough")
+	}
 	if inject && !usable {
-		w.Header().Set("Retry-After", "30")
-		fail(w, 503, "state_unavailable", "尚未采到合格 state。这是本地拦截，不是上游 503。请打开管理面板检查出口，或明确关闭注入后使用普通转发；探测有冷却时间。")
+		message, seconds := s.unavailableMessage()
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		fail(w, 503, "state_unavailable", message)
 		return
 	}
 	route := 0
@@ -110,7 +141,7 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if inject && usable {
+	if (inject || compact) && usable {
 		route = snapshot.Route
 	}
 	target, _ := url.Parse(e.config.Upstream)
@@ -119,9 +150,16 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			pr.Out.URL.Scheme = target.Scheme
 			pr.Out.URL.Host = target.Host
 			pr.Out.URL.Path = strings.TrimRight(target.Path, "/") + strings.TrimPrefix(pr.In.URL.Path, "/backend-api/codex")
+			if bridgeCompact {
+				pr.Out.URL.Path = strings.TrimRight(target.Path, "/") + "/responses"
+				pr.Out.Header.Set("Accept", "text/event-stream")
+				pr.Out.Header.Set("Accept-Encoding", "identity")
+			}
 			pr.Out.URL.RawPath = ""
 			pr.Out.Host = target.Host
-			pr.Out.Header.Del(turnstate.Header)
+			if e.config.IsRelay() {
+				pr.Out.Header.Del(turnstate.Header)
+			}
 			pr.Out.Header.Del("Cookie")
 			pr.Out.Header.Del("Proxy-Authorization")
 			if e.config.IsRelay() {
@@ -147,6 +185,9 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				resp.Header.Set("X-Sleep-State-Error-Source", "upstream")
 			}
 			e.reject(s, resp.StatusCode, retryDelay(resp.Header.Get("Retry-After")), route)
+			if bridgeCompact && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				return e.bridgeCompactResponse(resp, s, route)
+			}
 			if inject && resp.StatusCode >= 200 && resp.StatusCode < 300 && s.state.Observe(resp.Header.Get(turnstate.Header), snapshot, time.Now()) {
 				// Never replay a generation request: it may already have run upstream.
 				resp.Body.Close()
@@ -155,6 +196,15 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			var compactFailure *compactError
+			if errors.As(err, &compactFailure) {
+				if compactFailure.status == 429 {
+					_, seconds := s.rejection()
+					w.Header().Set("Retry-After", strconv.Itoa(seconds))
+				}
+				fail(w, compactFailure.status, compactFailure.code, compactFailure.message)
+				return
+			}
 			if errors.Is(err, errShape) {
 				fail(w, 503, "state_shape_changed", "Upstream state changed shape. Request was not replayed; check status before retrying.")
 				return
@@ -165,7 +215,7 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	tracked := &statusWriter{ResponseWriter: w, status: 200}
 	defer func() {
-		e.log.Info("request_finished", "status", tracked.status, "duration_ms", time.Since(started).Milliseconds(), "route", e.routes[route].ID, "state_version", snapshot.Version)
+		e.log.Info("request_finished", "status", tracked.status, "duration_ms", time.Since(started).Milliseconds(), "route", e.routes[route].ID, "state_version", snapshot.Version, "model", s.model, "compaction", compact)
 	}()
 	proxy.ServeHTTP(tracked, r)
 }
@@ -253,4 +303,21 @@ func officialCredential(auth string) bool {
 	_ = json.Unmarshal(claims["iss"], &issuer)
 	u, err := url.Parse(issuer)
 	return err == nil && (u.Hostname() == "auth.openai.com" || u.Hostname() == "auth0.openai.com")
+}
+
+// Remote compaction v2 uses /responses with a final protocol item rather than
+// /responses/compact. Match the actual item, not text that mentions its name.
+func remoteCompactionV2(body []byte) bool {
+	var request struct {
+		Input []json.RawMessage `json:"input"`
+	}
+	if json.Unmarshal(body, &request) != nil || len(request.Input) == 0 {
+		return false
+	}
+	var last map[string]json.RawMessage
+	if json.Unmarshal(request.Input[len(request.Input)-1], &last) != nil || len(last) != 1 {
+		return false
+	}
+	var kind string
+	return json.Unmarshal(last["type"], &kind) == nil && kind == "compaction_trigger"
 }

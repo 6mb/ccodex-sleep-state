@@ -89,7 +89,7 @@ func TestRestorePreservesUserEdits(t *testing.T) {
 	if err := os.WriteFile(target, changed, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := Restore(dir); err == nil || !strings.Contains(err.Error(), "refusing") {
+	if err := Restore(dir); err == nil || !strings.Contains(err.Error(), "出于安全原因暂不覆盖") {
 		t.Fatal("expected restore conflict")
 	}
 	current, _ := os.ReadFile(target)

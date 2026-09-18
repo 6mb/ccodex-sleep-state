@@ -44,6 +44,12 @@ jobs:
             cp LICENSE THIRD_PARTY_NOTICES.md README.md "dist/$name/"
             cp -R docs "dist/$name/"
             if [ "$GOOS" = windows ]; then
+              cp scripts/start.cmd "dist/$name/start.cmd"
+            else
+              cp scripts/start.command "dist/$name/start.command"
+              chmod +x "dist/$name/start.command"
+            fi
+            if [ "$GOOS" = windows ]; then
               (cd dist && zip -qr "$name.zip" "$name")
             else
               tar -czf "dist/$name.tar.gz" -C dist "$name"
@@ -86,4 +92,4 @@ jobs:
           set -euo pipefail
           gh release create "$VERSION" dist/* --verify-tag --prerelease \
             --title "$VERSION" \
-            --notes '仅支持 Astra 的实验性本地服务。使用真实账号前，请先阅读隐私、额度消耗与配置恢复说明。Windows 和 macOS 压缩包附带中文教程；源码包包含锁定版本的依赖及许可证。'
+            --notes '支持 Astra、Sol、Terra 的实验性本地服务。新增双击启动、配置修复、个人/Team 规则和远程压缩兼容。请先阅读本版本测试记录：支持不等于账号具有模型权限，不保证取得指定长度的 state。Windows 和 macOS 包附中文教程与启动脚本；源码包包含锁定依赖和许可证。'

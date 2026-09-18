@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/gylive/ccodex-sleep-state/internal/codexconfig"
 	"github.com/gylive/ccodex-sleep-state/internal/proxyroute"
 	"github.com/gylive/ccodex-sleep-state/internal/settings"
 	"io"
@@ -97,6 +98,179 @@ func (c *control) api(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	fail := func(err error) { reply(w, 400, map[string]string{"error": err.Error()}) }
 	switch r.URL.Path {
+	case "/admin/api/quick-setup":
+		if err := c.quickSetup(ctx); err != nil {
+			fail(err)
+			return
+		}
+		reply(w, 200, map[string]string{"message": "本机配置已备份并接入，尚未验证外网或模型。请重启 Codex 并发一条消息；采不到合格 state 时先普通转发。"})
+	case "/admin/api/state/retry":
+		var v struct {
+			ID string `json:"id"`
+		}
+		if err := decode(w, r, &v); err != nil {
+			fail(err)
+			return
+		}
+		if c.rescue || c.engine == nil || c.setupError != "" || c.routeError != "" {
+			fail(errors.New("服务尚未接入，请先处理配置或出口问题"))
+			return
+		}
+		if err := c.checkManaged(); err != nil {
+			fail(errors.New("Codex 配置已改变，请先检查与修复配置"))
+			return
+		}
+		if err := c.engine.RetryState(ctx, v.ID); err != nil {
+			fail(err)
+			return
+		}
+		reply(w, 200, map[string]string{"message": "本轮采集已完成。请查看会话里的实际长度和结果；采不到时不会自动重复消耗额度。"})
+	case "/admin/api/codex-config/preview":
+		value, err := c.cleanPreview()
+		if err != nil {
+			fail(err)
+			return
+		}
+		reply(w, 200, value)
+	case "/admin/api/codex-config/rebuild":
+		var v rebuildRequest
+		if err := decode(w, r, &v); err != nil {
+			fail(err)
+			return
+		}
+		c.pause()
+		defer c.resume()
+		if c.engine != nil && c.engine.Restricted() {
+			reply(w, 409, map[string]string{"error": "上游拒绝或限流尚未解除，不能重新建立连接"})
+			return
+		}
+		if err := c.rebuildConfig(v); err != nil {
+			fail(err)
+			return
+		}
+		c.stop() // The old engine must never resume after changing provider/auth.
+		c.setup()
+		if c.setupError != "" {
+			fail(errors.New(c.setupError))
+			return
+		}
+		routes, err := proxyroute.Load(ctx, c.config)
+		if err != nil {
+			c.routeError = err.Error()
+			fail(err)
+			return
+		}
+		c.stop()
+		c.start(routes)
+		if c.engine == nil {
+			fail(errors.New("配置已保存，但固定出口已失效。请在路由页恢复自动选择。"))
+			return
+		}
+		reply(w, 200, map[string]string{"message": "原 Codex 配置已完整备份，已按你选择的连接方式重建并接管。登录文件未修改。请重启 Codex；原来的插件和其他个性化设置仍在本机备份中。"})
+	case "/admin/api/service-config/preview":
+		value, err := c.rescuePreview()
+		if err != nil {
+			fail(err)
+			return
+		}
+		reply(w, 200, value)
+	case "/admin/api/service-config/reset":
+		var v struct {
+			SHA string `json:"expected_config_sha256"`
+		}
+		if err := decode(w, r, &v); err != nil {
+			fail(err)
+			return
+		}
+		if err := c.resetServiceConfig(v.SHA); err != nil {
+			fail(err)
+			return
+		}
+		reply(w, 200, map[string]string{"message": "原配置已备份，默认配置已生成且关闭注入。请退出此修复服务，再双击启动脚本或运行 setup。原订阅和代理信息仅在本机备份里，没有上传。"})
+	case "/admin/api/recovery/preview":
+		if !c.configure {
+			fail(errors.New("当前为 --no-config 只读模式，请用 setup 重新启动"))
+			return
+		}
+		preview, err := codexconfig.PreviewRecovery(c.dir)
+		if err != nil {
+			fail(err)
+			return
+		}
+		message := "发现旧接管记录。建议保留当前配置；无法安全合并时，再选择恢复旧备份。"
+		if !preview.Needed {
+			message = "没有遗留恢复记录，可以直接点击重新检查并接管。"
+		}
+		if preview.Reason != "" {
+			message += " " + preview.Reason
+		}
+		reply(w, 200, map[string]any{"message": message, "needed": preview.Needed, "can_keep_current": preview.CanKeepCurrent, "can_restore_backup": preview.CanRestoreBackup, "config_sha256": preview.ConfigSHA256, "transaction_sha256": preview.TransactionSHA256})
+	case "/admin/api/recovery/apply":
+		if !c.configure {
+			fail(errors.New("当前为 --no-config 只读模式，未修改配置"))
+			return
+		}
+		var v struct {
+			Mode           string `json:"mode"`
+			ConfigSHA      string `json:"expected_config_sha256"`
+			TransactionSHA string `json:"expected_transaction_sha256"`
+		}
+		if err := decode(w, r, &v); err != nil {
+			fail(err)
+			return
+		}
+		c.pause()
+		defer c.resume()
+		if c.engine != nil && c.engine.Restricted() {
+			reply(w, 409, map[string]string{"error": "上游拒绝或限流尚未解除，不能通过重新接管重置等待状态。"})
+			return
+		}
+		if _, err := codexconfig.Recover(c.dir, codexconfig.RecoveryOptions{Mode: v.Mode, ExpectedConfigSHA256: v.ConfigSHA, ExpectedTransactionSHA256: v.TransactionSHA}); err != nil {
+			fail(err)
+			return
+		}
+		c.managed = false
+		c.stop() // The old engine must never resume after changing provider/auth.
+		c.setup()
+		if c.setupError != "" {
+			fail(errors.New(c.setupError))
+			return
+		}
+		routes, err := proxyroute.Load(ctx, c.config)
+		if err != nil {
+			c.routeError = err.Error()
+			fail(err)
+			return
+		}
+		c.stop()
+		c.start(routes)
+		if c.engine == nil {
+			fail(errors.New("配置已保存，但固定出口已失效。请在路由页恢复自动选择。"))
+			return
+		}
+		reply(w, 200, map[string]string{"message": "旧配置已处理，当前文件与恢复记录已独立备份，Codex 已重新接管。请重启 Codex 并新建会话。"})
+	case "/admin/api/preferences":
+		var v struct {
+			Model         string `json:"model"`
+			AccountMode   string `json:"account_mode"`
+			StateFallback string `json:"state_fallback"`
+		}
+		if err := decode(w, r, &v); err != nil {
+			fail(err)
+			return
+		}
+		if err := c.applyPreferences(ctx, v.Model, v.AccountMode, v.StateFallback); err != nil {
+			fail(err)
+			return
+		}
+		reply(w, 200, map[string]string{"message": "设置已保存。账号规则已生效；更换默认模型后，请重启 Codex 或新建会话。服务不冒充上游没有提供的模型。"})
+	case "/admin/api/diagnostics":
+		reply(w, 200, map[string]any{"traffic": c.history.snapshot(), "configuration_writable": c.configure, "configured_codex": c.managed, "model": c.config.SelectedModel(), "account_mode": c.config.AccountMode, "route_count": func() any {
+			if c.engine != nil {
+				return c.engine.Status()["routes"]
+			}
+			return 0
+		}(), "note": "只包含本次运行的请求类别、HTTP 状态和耗时；没有提示词、凭据、订阅地址或 state。"})
 	case "/admin/api/injection":
 		var v struct {
 			Enabled bool `json:"enabled"`
@@ -156,6 +330,10 @@ func (c *control) api(w http.ResponseWriter, r *http.Request) {
 		c.stop()
 		c.config = next
 		c.start(routes)
+		if c.engine == nil {
+			fail(errors.New("配置已保存，但固定出口已失效。请在路由页恢复自动选择。"))
+			return
+		}
 		reply(w, 200, map[string]string{"message": "出口已应用，不需要重启服务。旧 state 已清空，下次 Codex 请求会按新出口重新采集。"})
 	case "/admin/api/routes", "/admin/api/routes/test", "/admin/api/routes/pin":
 		var v struct {
@@ -201,7 +379,7 @@ func (c *control) api(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			resp.Body.Close()
-			reply(w, 200, map[string]any{"message": "已收到 HTTP 响应。测试未携带登录信息，401/403 不代表你的账号被拒绝；这不证明能采到 292。", "status": resp.StatusCode, "duration_ms": time.Since(start).Milliseconds()})
+			reply(w, 200, map[string]any{"message": "已收到 HTTP 响应。测试未携带登录信息，401/403 不代表你的账号被拒绝；这不证明能采到符合账号规则的 state，也不证明模型可用。", "status": resp.StatusCode, "duration_ms": time.Since(start).Milliseconds()})
 			return
 		}
 		c.pause()
@@ -221,14 +399,23 @@ func (c *control) api(w http.ResponseWriter, r *http.Request) {
 		c.stop()
 		c.config = next
 		c.start(routes)
+		if c.engine == nil {
+			fail(errors.New("配置已保存，但固定出口已失效。请在路由页恢复自动选择。"))
+			return
+		}
 		reply(w, 200, map[string]string{"message": "路由已切换，旧 state 已清空。"})
 	case "/admin/api/recover":
+		if !c.configure {
+			fail(errors.New("当前使用 --no-config 只读启动。请停止服务后使用 setup 启动，再接管配置；本次没有修改任何文件。"))
+			return
+		}
 		c.pause()
 		defer c.resume()
 		if c.engine != nil && c.engine.Restricted() {
 			reply(w, 409, map[string]string{"error": "当前账号仍处于上游拒绝或限流状态，请先处理登录或等待。"})
 			return
 		}
+		c.stop() // The old engine must never resume after changing provider/auth.
 		c.setup()
 		if c.setupError != "" {
 			fail(errors.New(c.setupError))
@@ -242,6 +429,10 @@ func (c *control) api(w http.ResponseWriter, r *http.Request) {
 		}
 		c.stop()
 		c.start(routes)
+		if c.engine == nil {
+			fail(errors.New("配置已保存，但固定出口已失效。请在路由页恢复自动选择。"))
+			return
+		}
 		reply(w, 200, map[string]string{"message": "配置检查完成。接管配置后请重启 Codex。"})
 	default:
 		reply(w, 404, map[string]string{"error": "没有这个管理接口"})
