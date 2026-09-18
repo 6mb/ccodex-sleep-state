@@ -1,10 +1,14 @@
-# Windows 使用教程
+# Windows：从解压到接上 Codex
 
-先把你自己的订阅或代理接进来，再启动服务，让 Codex 通过它发请求。整个过程不需要装 Go，也不用开管理员终端。Codex 继续使用你原来的登录。
+准备好已经登录的 Codex，以及你自己的订阅或代理。下面按第一次使用来写，不需要装 Go，也不用管理员权限。
+
+先说明当前进度：这是早期测试版，跑通本地测试不等于所有人的 Codex 都能接上。第一次先用一个简单问题验证，别直接拿正在赶工的长任务试。最新结果看[测试记录](testing.md)。
 
 ## 1. 放好程序
 
-在 Releases 选适合电脑架构的 Windows ZIP。解压到下面这个位置比较省心：
+到 [Releases](https://github.com/gylive/ccodex-sleep-state/releases) 下载 Windows ZIP。大多数电脑选 `windows-amd64`；只有 ARM 设备选 `windows-arm64`。如果页面暂时没有发布包，可以等待发布，或按[构建教程](development.md)自己编译。
+
+建议解压到：
 
 ```text
 %LOCALAPPDATA%\Programs\ccodex-sleep-state
@@ -22,9 +26,15 @@
 
 发布二进制未做商业代码签名。若 Windows 给出来源提示，先核对 GitHub 仓库、版本和 SHA256；不要为了运行它全局关闭 Defender 或 SmartScreen。
 
-## 2. 填自己的出口
+## 2. 选一种接法
 
-默认配置走直连。用订阅的读[订阅导入](proxies.md)，已有本地代理软件的只需填它提供的 HTTP 或 SOCKS5 地址，不需要导出整份代理配置。
+默认配置是直连。按你的情况选一种就行：
+
+- **有订阅链接：** 按[订阅导入](proxies.md#用订阅链接)填写。程序会自己解析节点。
+- **已经开着代理软件：** 找到软件提供的 HTTP 或 SOCKS5 监听地址，按[已有代理](proxies.md#已有-http--socks5-代理)填写。不需要导出整份配置。
+- **本机能直接访问上游：** 先保留默认值。
+
+打开本工具的配置：
 
 ```powershell
 notepad "$env:LOCALAPPDATA\ccodex-sleep-state\config.json"
@@ -54,7 +64,7 @@ notepad "$env:LOCALAPPDATA\ccodex-sleep-state\config.json"
 
 这个窗口就是服务，使用期间保持打开。暂时没有开机自启，关机后下次再运行一次 `serve`。
 
-## 4. 看它是否接上了
+## 4. 别只看窗口没报错，要确认请求进来了
 
 另开一个 PowerShell，同样进入程序目录：
 
@@ -62,7 +72,9 @@ notepad "$env:LOCALAPPDATA\ccodex-sleep-state\config.json"
 .\ccodex-sleep-state.exe status
 ```
 
-几个字段够用了：
+先看 `sessions`：发过 Astra 请求后，这里应该出现会话。再看 `usable`：为 `true` 表示已经采到了符合本地规则的 state。两者都正常、Codex 也收到了回复，才说明这次请求走通了；这仍不等于已经证明回答质量提高。
+
+其他字段排错时再看：
 
 - `routes`：可用配置中的出口数量，不代表每个出口已经联网成功。
 - `sessions`：服务在内存中记住的凭据会话；刚启动时为空是正常的。
@@ -94,7 +106,7 @@ notepad "$env:LOCALAPPDATA\ccodex-sleep-state\config.json"
 | 表现 | 先检查 |
 |---|---|
 | 端口被占用 | 是否已经开过一个服务；不要同时开两个终端重复 `serve` |
-| `state_unavailable` | 查看探测状态码、订阅有效性和代理连接；等冷却期结束，不要连续重发 |
+| `state_unavailable` | 先看日志里的 `result`、`state_blocks` 和 `expected_blocks`；请求成功但块数不符也会报这个错。见[实测问题](testing.md#遇到同样的-503-怎么看)，不要连续重发 |
 | HTTP 401 / 403 | 在 Codex 中处理登录、账号权限或上游拒绝，不会继续换 IP 撞 |
 | HTTP 429 | 等额度或速率限制恢复；程序不会重置额度 |
 | `state_shape_changed` | 这是封装基线变化，不是确定的质量结论；请求不会自动重放，上游可能已经消耗额度 |
@@ -102,3 +114,5 @@ notepad "$env:LOCALAPPDATA\ccodex-sleep-state\config.json"
 | `Encrypted content...` | 上游密文或会话链可能变了；先保留工作，再考虑新建任务，不会自动删除上下文链 |
 
 需要重置的是这个工具时，先正常退出并恢复配置，再决定是否保留它的数据目录。不要删除 Codex 的 `auth.json` 或整个 `.codex` 文件夹。
+
+还有问题，可以带着错误提示到 [Issues](https://github.com/gylive/ccodex-sleep-state/issues) 或[群里](../README.md#一起试一起反馈)交流。发之前先检查截图，别把订阅和登录信息一起带上。

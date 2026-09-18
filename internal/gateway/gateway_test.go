@@ -321,3 +321,60 @@ func TestRetryAfter(t *testing.T) {
 		t.Fatal("invalid delay accepted")
 	}
 }
+
+// The live upstream may issue a different envelope from our default heuristic.
+// Keep the default strict, but make the reason visible without logging secrets.
+func TestDifferentProbeShapeIsExplainedNotSilentlyAccepted(t *testing.T) {
+	token := fakeToken(11, 1)
+	var calls atomic.Int32
+	e, logs := testEngine(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		complete(w, token)
+	}))
+	w := httptest.NewRecorder()
+	e.ServeHTTP(w, request(generation, "synthetic-account-token"))
+	if w.Code != 503 || calls.Load() != 1 {
+		t.Fatal("unexpected shape must not reach generation")
+	}
+	var event struct {
+		Result         string `json:"result"`
+		StateBlocks    int    `json:"state_blocks"`
+		ExpectedBlocks int    `json:"expected_blocks"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &event); err != nil {
+		t.Fatal(err)
+	}
+	if event.Result != "shape_mismatch" || event.StateBlocks != 11 || event.ExpectedBlocks != 10 {
+		t.Fatalf("missing diagnostic: %+v", event)
+	}
+	if strings.Contains(logs.String(), token) || strings.Contains(logs.String(), "synthetic-account-token") {
+		t.Fatal("probe diagnostic leaked a secret")
+	}
+}
+
+func TestExplicitBaselineInjectsAndAllowsMissingResponseState(t *testing.T) {
+	token := fakeToken(11, 1)
+	var injected atomic.Int32
+	e, _ := testEngine(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(turnstate.Header) == "" {
+			complete(w, token)
+			return
+		}
+		if r.Header.Get(turnstate.Header) != token {
+			t.Error("state changed between collection and injection")
+		}
+		injected.Add(1)
+		complete(w, "")
+	}))
+	e.config.BaselineBlocks = 11
+	for i := 0; i < 2; i++ {
+		w := httptest.NewRecorder()
+		e.ServeHTTP(w, request(generation, "synthetic-account-token"))
+		if w.Code != 200 {
+			t.Fatal(w.Code)
+		}
+	}
+	if injected.Load() != 2 {
+		t.Fatal("missing response header must not discard the active state")
+	}
+}

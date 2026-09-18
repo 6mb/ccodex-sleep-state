@@ -171,7 +171,21 @@ func (e *Engine) refresh(ctx context.Context, s *session) {
 		if err == nil {
 			accepted = s.state.Offer(token, route, time.Now())
 		}
-		e.log.Info("probe_finished", "route", e.routes[route].ID, "status", status, "accepted", accepted)
+		result := "request_failed"
+		if err == nil {
+			switch {
+			case accepted:
+				result = "accepted"
+			case token.Blocks != e.config.BaselineBlocks:
+				result = "shape_mismatch"
+			default:
+				result = "state_time_rejected"
+			}
+		}
+		// Shape metadata explains a rejected probe without exposing its token.
+		e.log.Info("probe_finished", "route", e.routes[route].ID, "status", status,
+			"accepted", accepted, "result", result, "state_blocks", token.Blocks,
+			"expected_blocks", e.config.BaselineBlocks)
 		// Account and quota errors are not an invitation to try more IP addresses.
 		if status == 401 || status == 403 || status == 429 {
 			s.mu.Lock()

@@ -1,8 +1,8 @@
-# macOS 使用教程
+# macOS：安装、启动和恢复
 
-用法和 Windows 一样：接入自己的出口，启动服务，然后重启 Codex。
+先在 Codex 里登录，再准备自己的订阅或代理。这个程序没有安装器，把可执行文件放好就能用。当前还是早期测试版，先用一个简单问题验证链路；[测试记录](testing.md)会说明实际跑到了哪一步。
 
-Apple 芯片选 `darwin-arm64`，Intel 芯片选 `darwin-amd64`。下载 Releases 压缩包，核对来源和 SHA256，然后解压。示例假定你已经在解压目录：
+Apple 芯片选 `darwin-arm64`，Intel 芯片选 `darwin-amd64`。到 [Releases](https://github.com/gylive/ccodex-sleep-state/releases) 下载压缩包（没有发布包时可[从源码构建](development.md)），核对来源和 SHA256，然后解压。示例假定你已经在解压目录：
 
 ```sh
 mkdir -p "$HOME/.local/bin"

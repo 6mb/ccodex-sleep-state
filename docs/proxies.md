@@ -1,12 +1,14 @@
-# 接入订阅和代理
+# 把自己的订阅或代理接进来
 
 有订阅链接，直接导入订阅；已经有可用的 HTTP 或 SOCKS5 代理，也可以只填代理地址。它们都只给这个程序用，不会改变其他应用的网络设置。
 
 Clash/Mihomo 订阅读取顶层 `proxies` 里的实际节点，规则、DNS、TUN 和代理组不一起导入。如果拿到的是只有 `proxy-providers` 的配置，需要换成包含节点的订阅。
 
-## 订阅链接：优先放进环境变量
+## 用订阅链接
 
-不要把私有订阅链接提交到仓库。PowerShell 可以这样读入，输入不会显示在屏幕上，也不会写进命令历史：
+订阅链接通常自带访问凭据，别贴到 Issue 或群里。下面用环境变量传给程序，不把链接写进配置。每次新开终端需要重新输入一次。
+
+在 PowerShell 运行下面三行，再按提示粘贴订阅链接；输入内容不会显示，也不会写进命令历史：
 
 ```powershell
 $secret = Read-Host "粘贴订阅链接" -AsSecureString
@@ -45,7 +47,17 @@ printf '\n'
 
 ## 已有 HTTP / SOCKS5 代理
 
-把完整代理 URI 放入环境变量，与订阅读入方法相同。下面只展示格式，`HOST`、`PORT`、`USER`、`TOKEN` 必须换成你自己的值：
+先在你的代理软件里找到实际监听地址和端口，确认代理软件还在运行。不要照抄别人的端口。
+
+在 PowerShell 这样输入完整地址：
+
+```powershell
+$secret = Read-Host "输入 HTTP 或 SOCKS5 代理地址" -AsSecureString
+$env:CCODEX_PROXY = [System.Net.NetworkCredential]::new("", $secret).Password
+Remove-Variable secret
+```
+
+地址格式如下。`HOST`、`PORT`、`USER`、`TOKEN` 换成你自己的值：
 
 ```text
 http://HOST:PORT
@@ -65,6 +77,16 @@ http://USER:TOKEN@HOST:PORT
   "subscriptions": []
 }
 ```
+
+macOS 默认 zsh 输入方式：
+
+```sh
+read -rs 'CCODEX_PROXY?输入 HTTP 或 SOCKS5 代理地址：'
+export CCODEX_PROXY
+printf '\n'
+```
+
+然后在同一个终端运行 `check` 和 `serve`。
 
 不含凭据的本地代理地址也可以直接放在 `proxy_urls`。多个 URI 按数组顺序加入出口池。启用 `direct` 会把直连作为第一个出口；只想走代理，请保持 `false`。
 
