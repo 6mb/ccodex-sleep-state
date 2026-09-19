@@ -169,6 +169,28 @@
             </form>
           </section>
           <section class="card">
+            <h2>采集时间与次数</h2>
+            <p>不确定就用默认值。这里控制本地采集，不改变套餐额度、官方限流或上游 state 的真实寿命。关闭注入或使用中转时，这些设置不触发采集。</p>
+            <form id="timing-form">
+              <div class="settings-grid">
+                <div><label for="probe-timeout">单次探测超时（秒）</label><input id="probe-timeout" type="number" min="1" max="60" step="1" required /><small>1–60 秒；不是正常回复的超时。</small></div>
+                <div><label for="probe-cooldown">两轮采集最短间隔（秒）</label><input id="probe-cooldown" type="number" min="30" max="3600" step="1" required /><small>30–3600 秒；上游要求等待更久时，以更久为准。</small></div>
+                <div><label for="state-ttl">本地 state 有效期（秒）</label><input id="state-ttl" type="number" min="120" max="3600" step="1" required /><small>120–3600 秒，从 state 签发时间计算；最后 30 秒不再接纳新请求。</small></div>
+                <div><label for="refresh-before">到期前多久刷新（秒）</label><input id="refresh-before" type="number" min="30" max="3599" step="1" required /><small>至少 30 秒，必须小于有效期；不是每隔这么久刷新。</small></div>
+                <div><label for="max-probes">每轮最多探测次数</label><input id="max-probes" type="number" min="1" max="20" step="1" required /><small>1–20 次；每次模型探测可能消耗额度。</small></div>
+              </div>
+              <p id="timing-summary" class="hint" aria-live="polite"></p>
+              <div class="actions">
+                <button type="button" id="timing-defaults" class="secondary">填入默认值</button>
+                <button type="button" id="timing-low-frequency" class="secondary">低频采集预设</button>
+                <button type="button" id="timing-cancel" class="quiet">撤销未保存修改</button>
+                <button type="submit">保存采集设置</button>
+              </div>
+              <p class="hint">预设只填表，不自动保存。保存前会确认，成功后无需重启；现有 state 缓存会清空，后续请求可能重新采集。上游拒绝或限流期间不允许重建采集器。</p>
+              <p id="timing-result" class="result" role="status"></p>
+            </form>
+          </section>
+          <section class="card">
             <h2>CCS / CC Switch 与中转站</h2>
             <p>
               自动接管会检查当前选中的 Codex
@@ -198,7 +220,7 @@
               </p>
             </div>
             <p class="hint">
-              只读模式（--no-config）不会写入配置，需要退出后用 setup
+              只读模式（--no-config）不会写入 Codex 配置；仍可保存本工具的采集和代理设置。需要接管 Codex 时，退出后用 setup
               启动。切换完成后重启 Codex，让新会话使用新配置。
             </p>
           </section>

@@ -200,9 +200,9 @@ func (c *control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		adminURL := "http://" + c.config.Listen + "/admin/"
 		message += " 管理面板：" + adminURL
 		reply(w, 503, map[string]string{
-			"error": "service_not_ready",
-			"message": message,
-			"admin_url": adminURL,
+			"error":       "service_not_ready",
+			"message":     message,
+			"admin_url":   adminURL,
 			"next_action": "打开 admin_url，按页面唯一的绿色按钮继续；不要在 CCS 或 Codex 中手改配置。",
 		})
 		return
@@ -230,6 +230,8 @@ func (c *control) status() map[string]any {
 	result["supported_models"] = settings.SupportedModels()
 	result["account_mode"] = c.config.AccountMode
 	result["state_fallback"] = c.config.StateFallback
+	result["timing"] = timingFrom(c.config)
+	result["timing_defaults"] = timingFrom(settings.Default())
 	result["traffic"] = c.history.snapshot()
 	result["injection_effective"] = !c.effective().InjectionDisabled && c.engine != nil && result["configured_codex"] == true && result["config_error"] == "" && c.routeError == ""
 	if c.effective().IsRelay() {

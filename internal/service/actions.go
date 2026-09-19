@@ -249,6 +249,21 @@ func (c *control) api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		reply(w, 200, map[string]string{"message": "旧配置已处理，当前文件与恢复记录已独立备份，Codex 已重新接管。请重启 Codex 并新建会话。"})
+	case "/admin/api/timing":
+		var v timingPreferences
+		if err := decode(w, r, &v); err != nil {
+			fail(err)
+			return
+		}
+		if c.rescue {
+			fail(errors.New("请先修复服务配置，再保存采集时间"))
+			return
+		}
+		if err := c.applyPreferences(ctx, c.config.Model, c.config.AccountMode, c.config.StateFallback, v); err != nil {
+			fail(err)
+			return
+		}
+		reply(w, 200, map[string]string{"message": "采集设置已备份并保存，即刻生效，无需重启 Codex。旧 state 缓存已清空；后续请求可能重新采集并消耗额度。上游限流不会被重置。"})
 	case "/admin/api/preferences":
 		var v struct {
 			Model         string `json:"model"`
