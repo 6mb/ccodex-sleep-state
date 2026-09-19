@@ -21,7 +21,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Check out the fork
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
 
@@ -54,7 +54,9 @@ jobs:
             fork_json="$RUNNER_TEMP/upstream-releases/$tag.fork.json"
             gh api "repos/$UPSTREAM/releases/tags/$tag" > "$upstream_json"
 
+            fork_release_exists=false
             if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$fork_json" 2>/dev/null; then
+              fork_release_exists=true
               upstream_state=$(jq -cS '{name, body, prerelease, assets: [.assets[] | {name, size, digest}] | sort_by(.name)}' "$upstream_json")
               fork_state=$(jq -cS '{name, body, prerelease, assets: [.assets[] | {name, size, digest}] | sort_by(.name)}' "$fork_json")
               if [[ "$upstream_state" == "$fork_state" ]]; then
@@ -74,7 +76,7 @@ jobs:
             fi
             (cd "$release_dir" && sha256sum -c SHA256SUMS)
 
-            if [[ -s "$fork_json" ]]; then
+            if [[ "$fork_release_exists" == true ]]; then
               gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes
             fi
 
