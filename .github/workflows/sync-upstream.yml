@@ -82,7 +82,7 @@ jobs:
 
             title=$(jq -r '.name // .tag_name' "$upstream_json")
             notes_file="$RUNNER_TEMP/upstream-releases/$tag.notes.md"
-            jq -r '.body // ""' "$upstream_json" > "$notes_file"
+            jq -j '.body // ""' "$upstream_json" > "$notes_file"
             args=(
               release create "$tag"
               --repo "$GITHUB_REPOSITORY"
