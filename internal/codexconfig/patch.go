@@ -180,7 +180,10 @@ func PatchWithOptions(original []byte, baseURL string, options Options) ([]byte,
 	// The parent table may already be explicitly declared in the user file.
 	block = bytes.TrimPrefix(block, []byte("[model_providers]\n"))
 	updated = append(updated, block...)
-	if toml.Unmarshal(updated, &document) != nil {
+	// Decode into a fresh map: reusing the one holding the original's array
+	// tables makes go-toml append through an unaddressable map value and panic.
+	var verified map[string]any
+	if toml.Unmarshal(updated, &verified) != nil {
 		return nil, errors.New("managed provider conflicts with existing TOML; left unchanged")
 	}
 	return updated, nil

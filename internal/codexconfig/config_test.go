@@ -115,3 +115,24 @@ func TestSymlinkNotReplaced(t *testing.T) {
 		t.Fatal("symlink changed")
 	}
 }
+
+// Regression: re-validating the patched document must not decode into the map
+// already holding the original's array tables, which panics inside go-toml.
+func TestPatchConfigWithArrayTables(t *testing.T) {
+	source := []byte("model = 'old'\n[[skills.config]]\nname = 'first'\n[[skills.config]]\nname = 'second'\n")
+	patched, err := Patch(source, "http://127.0.0.1:17841/backend-api/codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err = toml.Unmarshal(patched, &document); err != nil {
+		t.Fatal(err)
+	}
+	if document["model"] != "gpt-6-astra" || document["model_provider"] != provider {
+		t.Fatal("root settings incorrect")
+	}
+	skills, _ := document["skills"].(map[string]any)
+	if entries, _ := skills["config"].([]any); len(entries) != 2 {
+		t.Fatalf("array table lost: %v", skills["config"])
+	}
+}
