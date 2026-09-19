@@ -169,3 +169,15 @@ GitHub Actions 在 Windows、macOS、Linux runner 上执行 `go vet`、全包竞
 **结论边界：**这证明本轮所用链路可采集、注入、关闭注入后正常转发，不证明降智已消失，不保证每个订阅都能取得 292。CCS / 中转兼容不等于对所有第三方中转站、所有 Windows 桌面客户端做过真实验收。
 
 另用实际 Codex CLI 连接本地模拟中转，验收两种配置：`env_key` 与 CCS 常见的 `requires_openai_auth=true` + `auth.json` API Key。两组均自动接管原 `/v1` provider，正确传递 API Key，不带 ChatGPT 账号头或 turn-state，收到完整 SSE、回复 OK、退出码 0；停止后原配置恢复。此测试未使用真实登录、未访问第三方中转、未消耗模型额度。
+
+## 2026-09-19：数组表启动修复与采集时间 WebUI
+
+- 先在旧 `patch.go` 上运行 PR #2 的 `TestPatchConfigWithArrayTables`，复现 `reflect.Value.SetLen using unaddressable value` panic；纳入原 PR 后 `go test ./internal/codexconfig -count=1` 通过。
+- `go vet ./...`、`go test -race -count=1 ./...` 全包通过。新增时间设置保存/回读/备份、不合法输入、缺鉴权、外部配置改动、固定出口丢失保护；既有 429 回归场景追加时间设置，确认不会清除限流状态。
+- 浏览器在独立临时数据目录、本机 17849 端口、`serve --no-config` 且关闭注入下验收：低频预设填入 600 秒/2 次；确认保存后刷新页面仍保留；提前刷新设成等于 TTL 时表单拒绝；未保存的 750 秒输入在状态刷新后仍保留，撤销恢复已保存值。
+- `node --check internal/service/web/app.js` 与 `bash -n scripts/build-release.sh` 通过。
+- 本轮不使用真实账号请求、不改操作者的 Codex 配置、不消耗模型额度。这里的通过不代表真实上游质量改善或全部桌面平台联调通过。
+
+### 可复现的本地打包
+
+先确保源码已提交，运行 `VERSION=版本号 bash scripts/build-release.sh`。脚本拒绝覆盖已有输出目录，也拒绝未提交源码，生成 Windows amd64/arm64、macOS arm64/amd64 四个包、带 vendor 依赖的对应源码包及 SHA256SUMS。仅交叉构建不代表已在四种机器上实际运行；推送后还需查看 GitHub Actions 的原生系统测试结果。

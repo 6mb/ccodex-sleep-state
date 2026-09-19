@@ -8,7 +8,7 @@
 
 一个服务，一个本地网页。官方 ChatGPT、官方 API key 和 Responses 中转按各自的认证方式走；支持 Astra、5.6 Sol、5.6 Terra，能否调用仍取决于你的账号和上游。已有代理软件就填本地 HTTP / SOCKS5 地址，也可以导入自己的订阅或本地文件。
 
-[Windows 上手](docs/windows.md) · [macOS 上手](docs/macos.md) · [面板教程](docs/web-panel.md) · [代理与订阅](docs/proxies.md) · [问题与验收清单](docs/issues-and-verification.md) · [测试记录](docs/testing.md) · [群聊交流](#一起试一起反馈)
+[Windows 上手](docs/windows.md) · [macOS 上手](docs/macos.md) · [面板教程](docs/web-panel.md) · [代理与订阅](docs/proxies.md) · [问题与验收清单](docs/issues-and-verification.md) · [测试记录](docs/testing.md) · [联系与交流](#一起试一起反馈)
 
 > **当前仍是公开测试版。** 此 README 描述当前源码；下载时以对应 Release 的说明为准，旧发布包不会自动多出新功能。本轮真实 Sol 回复、V2 远程压缩及压缩后回复、Terra 回复已跑通；追加的两次 Astra 短回复也成功，但本轮仍没有采到合格 292；旧式 V1 压缩直连上游返回 404，Team 仍只做合成测试。不能把部分成功写成全部验收通过。具体边界见[问题与验收清单](docs/issues-and-verification.md)。
 
@@ -49,6 +49,7 @@ macOS：
 | 看 Codex 有没有接上、请求有没有经过 | 「开始使用」里的配置、请求计数和会话 |
 | 开关 state 注入 | 「turn-state 注入」；开关开启不代表已经拿到合格 state |
 | 切 Astra / Sol / Terra | 「连接设置」里的模型与账号规则；修改默认模型后重启 Codex 或新建会话 |
+| 调整采集时间与次数 | 「连接设置」→「采集时间与次数」；支持默认值、低频预设、撤销修改和保存确认 |
 | Team 账号不再死等 292 | 「连接设置」选自动识别，识别不了就手动选 Team |
 | 没有合格 state 时先正常回复 | 首次 setup 未设置策略时采用普通转发兜底；「连接设置」可明确改成严格 |
 | 填本地代理、远程订阅、本地订阅文件 | 「订阅与代理」；不用手改 JSON，也不用猜环境变量在哪个终端生效 |
@@ -144,10 +145,10 @@ macOS 对应 `./ccodex-sleep-state doctor`。不要发 `auth.json`、管理口�
 
 用起来有没有改善、哪个版本接不上、什么情况下又出问题，都欢迎来聊。报错和复现步骤也可以提 [Issue](https://github.com/gylive/ccodex-sleep-state/issues)，方便后面查找。
 
-| 微信群 · 爱的交流 | QQ 群 · 此间大梦无边 |
+| 个人微信 · 等待 | QQ 群 · 此间大梦无边 |
 |:---:|:---:|
-| <img src="docs/assets/wechat-group-2026-09-18.jpg" alt="微信群“爱的交流”二维码，图中标注 9 月 25 日前有效" width="280"> | <img src="docs/assets/qq-group.jpg" alt="QQ 群“此间大梦无边”二维码，群号 754842541" width="280"> |
-| 图中标注 **9 月 25 日前有效**；过期后请先用 QQ 群入口。 | 扫码，或搜索群号 **754842541**。 |
+| <img src="docs/assets/wechat-personal.jpg" alt="作者个人微信二维码，扫码添加好友" width="280"> | <img src="docs/assets/qq-group.jpg" alt="QQ 群“此间大梦无边”二维码，群号 754842541" width="280"> |
+| 扫码添加作者个人微信；这是好友二维码，不是微信群入口。 | 扫码，或搜索群号 **754842541**。 |
 
 反馈时带上系统、Codex 版本、工具版本和错误提示就够了。**不要发账号凭据、完整订阅链接或未经检查的配置文件。**
 

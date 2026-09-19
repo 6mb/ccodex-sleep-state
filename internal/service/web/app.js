@@ -8,6 +8,27 @@ let busy = false;
 let noticeTimer;
 let recovery = null;
 let preferencesDirty = false;
+let timingDirty = false;
+const timingFields = {
+  probe_timeout_seconds: "probe-timeout",
+  probe_cooldown_seconds: "probe-cooldown",
+  state_ttl_seconds: "state-ttl",
+  refresh_before_seconds: "refresh-before",
+  max_probes_per_round: "max-probes",
+};
+function readTiming() {
+  return Object.fromEntries(Object.entries(timingFields).map(([key, id]) => [key, Number($(id).value)]));
+}
+function timingSummary() {
+  const t = readTiming();
+  $("refresh-before").setCustomValidity(t.refresh_before_seconds >= t.state_ttl_seconds ? "提前刷新时间必须小于本地有效期" : "");
+  $("timing-summary").textContent = `${timingDirty ? "尚未保存 · " : "已保存 · "}两轮至少相隔 ${t.probe_cooldown_seconds} 秒，每轮最多 ${t.max_probes_per_round} 次；state 签发约 ${t.state_ttl_seconds - t.refresh_before_seconds} 秒后进入刷新窗口。`;
+}
+function fillTiming(t) {
+  if (!t) return;
+  for (const [key, id] of Object.entries(timingFields)) $(id).value = t[key];
+  timingSummary();
+}
 function notice(text) {
   $("notice").textContent = text;
   $("notice").hidden = false;
@@ -112,6 +133,7 @@ async function refresh() {
     $("account-select").value = state.account_mode || "auto";
   if (!preferencesDirty && document.activeElement?.id !== "fallback-select")
     $("fallback-select").value = state.state_fallback || "strict";
+  if (!timingDirty) fillTiming(state.timing);
   const traffic = state.traffic || { total: 0, failed: 0, recent: [] };
   $("step-config").textContent = state.configured_codex
     ? "已接入 · 可检查或修复"
@@ -511,3 +533,34 @@ for (const id of ["model-select", "account-select", "fallback-select"])
   $(id).addEventListener("change", () => {
     preferencesDirty = true;
   });
+
+for (const id of Object.values(timingFields)) {
+  $(id).addEventListener("input", () => { timingDirty = true; timingSummary(); });
+}
+$("timing-defaults").addEventListener("click", () => {
+  if (!state) return;
+  timingDirty = true; fillTiming(state.timing_defaults);
+});
+$("timing-low-frequency").addEventListener("click", () => {
+  if (!state) return;
+  timingDirty = true;
+  fillTiming({ ...state.timing_defaults, probe_cooldown_seconds: 600, max_probes_per_round: 2 });
+});
+$("timing-cancel").addEventListener("click", () => {
+  if (!state) return;
+  timingDirty = false; fillTiming(state.timing);
+});
+$("timing-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  timingSummary();
+  if (!$("timing-form").reportValidity()) return;
+  const next = readTiming();
+  if (!confirm("保存采集设置？旧配置会备份，现有 state 缓存会清空。无需重启 Codex；后续请求可能重新采集并消耗额度。")) return;
+  action(async () => {
+    const result = await api("timing", next);
+    // Do not discard edits typed while the save request was in flight.
+    timingDirty = JSON.stringify(readTiming()) !== JSON.stringify(next);
+    $("timing-result").textContent = result.message;
+    await refresh();
+  });
+});

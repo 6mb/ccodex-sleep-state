@@ -255,6 +255,10 @@ func TestPanelPinAndApplyCannotClearQuotaRejection(t *testing.T) {
 	if w.Code != 409 {
 		t.Fatalf("quota cleared by apply: %d", w.Code)
 	}
+	w = panelPost(h, "timing", `{"probe_timeout_seconds":15,"probe_cooldown_seconds":600,"state_ttl_seconds":1800,"refresh_before_seconds":300,"max_probes_per_round":2}`)
+	if w.Code != 400 {
+		t.Fatalf("quota cleared by timing: %d", w.Code)
+	}
 	if c.engine != engine || !engine.Restricted() || diskConfig(t, c) != before || c.cancel == nil || calls.Load() != 1 {
 		t.Fatal("restricted generation not retained/resumed")
 	}
