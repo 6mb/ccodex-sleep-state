@@ -2,7 +2,8 @@ name: Sync upstream source and releases
 
 on:
   schedule:
-    - cron: '23 */6 * * *'
+    - cron: '37 * * * *'
+      timezone: 'Asia/Shanghai'
   workflow_dispatch:
 
 permissions:
@@ -25,7 +26,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Merge the upstream default branch and sync tags
+      - name: Sync upstream source while preserving fork workflows
         shell: bash
         run: |
           set -euo pipefail
@@ -33,10 +34,23 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git remote add upstream "https://github.com/$UPSTREAM.git" 2>/dev/null || \
             git remote set-url upstream "https://github.com/$UPSTREAM.git"
-          git fetch --prune --tags upstream
-          git merge --no-edit upstream/main
-          git push origin HEAD:main
-          git push origin --tags
+          git fetch --prune upstream \
+            '+refs/heads/main:refs/remotes/upstream/main'
+
+          rm -rf "$RUNNER_TEMP/fork-workflows"
+          cp -a .github/workflows "$RUNNER_TEMP/fork-workflows"
+          git restore --source=upstream/main --staged --worktree -- .
+          rm -rf .github/workflows
+          cp -a "$RUNNER_TEMP/fork-workflows" .github/workflows
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo 'Source is already synchronized'
+          else
+            upstream_sha=$(git rev-parse --short=12 upstream/main)
+            git commit -m "chore: sync upstream source at $upstream_sha"
+            git push origin HEAD:main
+          fi
 
       - name: Mirror upstream release files
         shell: bash
@@ -86,7 +100,7 @@ jobs:
             args=(
               release create "$tag"
               --repo "$GITHUB_REPOSITORY"
-              --verify-tag
+              --target main
               --title "$title"
               --notes-file "$notes_file"
             )
