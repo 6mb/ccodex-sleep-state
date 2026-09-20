@@ -151,10 +151,10 @@ macOS 对应 `./ccodex-sleep-state doctor`。不要发 `auth.json`、管理口�
 
 用起来有没有改善、哪个版本接不上、什么情况下又出问题，都欢迎来聊。报错和复现步骤也可以提 [Issue](https://github.com/gylive/ccodex-sleep-state/issues)，方便后面查找。
 
-| 个人微信 · 等待 | QQ 群 · 此间大梦无边 |
+| 个人微信 · 等待 | QQ 群 · 不过是大梦一场空 |
 |:---:|:---:|
-| <img src="docs/assets/wechat-personal.jpg" alt="作者个人微信二维码，扫码添加好友" width="280"> | <img src="docs/assets/qq-group.jpg" alt="QQ 群“此间大梦无边”二维码，群号 754842541" width="280"> |
-| 扫码添加作者个人微信；这是好友二维码，不是微信群入口。 | 扫码，或搜索群号 **754842541**。 |
+| <img src="docs/assets/wechat-personal.jpg" alt="作者个人微信二维码，扫码添加好友" width="280"> | <img src="docs/assets/qq-group.jpg" alt="QQ 群“不过是大梦一场空”二维码，群号 797481450" width="280"> |
+| 扫码添加作者个人微信；这是好友二维码，不是微信群入口。 | 扫码，或搜索群号 **797481450**。 |
 
 ### 朋友的卡网 · RedeemAI
 
